@@ -7,6 +7,7 @@
 | 脚本名称 | 适用网站 | 功能简介 | 安装链接 |
 |----------|----------|----------|----------|
 | [alicesw 章节导出工具](./alicesw-chapter-exporter/) | alicesw.com | 一键导出书籍章节目录（JSON/CSV/TXT/MD） | [安装](https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-chapter-exporter/alicesw-chapter-exporter.user.js) |
+| [alicesw 小说章节下载器](./alicesw-novel-downloader/) | alicesw.com | 批量下载每章小说正文为独立TXT文件 | [安装](https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js) |
 
 ## 使用说明
 
