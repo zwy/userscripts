@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         nnhm7 漫画CBZ下载器
 // @namespace    https://nnhm7.org/
-// @version      1.1
+// @version      1.2
 // @description  在 nnhm7.org 章节列表页批量下载漫画章节为CBZ格式（兼容 Komga 等本地漫画服务器）
 // @author       zwy
 // @match        https://nnhm7.org/comic/*
@@ -35,11 +35,11 @@
 
     // ─── 配置 ────────────────────────────────────────────────────────
     const CONFIG = {
-        pageDelay:  1200,   // 抓取每个章节页面的间隔(ms)
-        imgDelay:   300,    // 下载每张图片的间隔(ms)
-        retryMax:   3,      // 失败重试次数
-        retryDelay: 3000,   // 重试等待(ms)
-        imgConcur:  3,      // 图片并发下载数
+        pageDelay:  1200,
+        imgDelay:   300,
+        retryMax:   3,
+        retryDelay: 3000,
+        imgConcur:  3,
     };
 
     // ─── 工具 ────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@
         });
     }
 
-    // ─── 下载单张图片为 ArrayBuffer ───────────────────────────────────
+    // ─── 下载单张图片 ───────────────────────────────────
     function fetchImage(url, retry = 0) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -133,18 +133,14 @@
         });
     }
 
-    // 并发下载图片
     async function fetchImagesWithConcurrency(urls, onProgress) {
         const results = new Array(urls.length);
         let cursor = 0;
         async function worker() {
             while (cursor < urls.length) {
                 const idx = cursor++;
-                try {
-                    results[idx] = await fetchImage(urls[idx]);
-                } catch(e) {
-                    results[idx] = null;
-                }
+                try { results[idx] = await fetchImage(urls[idx]); }
+                catch(e) { results[idx] = null; }
                 onProgress(idx);
                 await sleep(CONFIG.imgDelay);
             }
@@ -153,18 +149,37 @@
         return results;
     }
 
-    // ─── 打包为 CBZ（带打包进度回调）────────────────────────────────────
+    // ─── 打包为 CBZ ───────────────────────────────────────────────────
+    // 说明：JSZip STORE 模式下内置 onUpdate 几乎不会触发（没有压缩计算过程）
+    // 改用自制进度：先分批异步将图片加入 zip，再 generateAsync
     async function packCbz(imageBuffers, imageUrls, onPackProgress) {
         const zip = new JSZip();
-        imageBuffers.forEach((buf, i) => {
-            if (!buf) return;
-            const ext = (imageUrls[i].match(/\.(jpe?g|png|webp|gif)$/i) || ['', 'jpg'])[1].toLowerCase();
-            const filename = `${String(i + 1).padStart(4, '0')}.${ext}`;
-            zip.file(filename, buf);
-        });
+        const total = imageBuffers.length;
+        let added = 0;
+
+        // 分批加入文件，每 20 张让出一次主线程，避免 UI 冻结
+        for (let i = 0; i < total; i++) {
+            const buf = imageBuffers[i];
+            if (buf) {
+                const ext = (imageUrls[i].match(/\.(jpe?g|png|webp|gif)$/i) || ['','jpg'])[1].toLowerCase();
+                zip.file(`${String(i + 1).padStart(4, '0')}.${ext}`, buf);
+            }
+            added++;
+            if (added % 20 === 0 || added === total) {
+                const pct = Math.round(added / total * 50); // 前 50% 给加文件阶段
+                onPackProgress && onPackProgress({ percent: pct });
+                await sleep(0); // 让出主线程
+            }
+        }
+
+        // generateAsync 阶段占后 50%
+        // 用 streamFiles:true 使 JSZip 分块处理，配合 onUpdate 触发
         return await zip.generateAsync(
-            { type: 'blob', compression: 'STORE' },
-            onPackProgress  // JSZip 原生进度回调：{ percent, currentFile }
+            { type: 'blob', compression: 'STORE', streamFiles: true },
+            (meta) => {
+                const pct = 50 + Math.round(meta.percent / 2); // 50~100%
+                onPackProgress && onPackProgress({ percent: pct });
+            }
         );
     }
 
@@ -197,7 +212,7 @@
 
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📦 漫画CBZ下载器 <span style="font-size:11px;color:#9ca3af">v1.1</span></strong>
+  <strong style="font-size:15px">📦 漫画CBZ下载器 <span style="font-size:11px;color:#9ca3af">v1.2</span></strong>
   <span id="cbzClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 
@@ -343,11 +358,9 @@
                     const failedImgs = imgBuffers.filter(b => !b).length;
                     if (failedImgs > 0) log(`  ⚠ ${failedImgs} 张图片下载失败，已跳过`, '#d97706');
 
-                    // 打包时显示打包进度
                     $('cbzImgProgress').textContent = '  打包 CBZ 中... 0%';
-                    const cbzBlob = await packCbz(imgBuffers, imgUrls, (meta) => {
-                        const pct = Math.round(meta.percent);
-                        $('cbzImgProgress').textContent = `  打包 CBZ 中... ${pct}%`;
+                    const cbzBlob = await packCbz(imgBuffers, imgUrls, ({ percent }) => {
+                        $('cbzImgProgress').textContent = `  打包 CBZ 中... ${percent}%`;
                     });
                     downloadBlob(cbzBlob, cbzName);
 
@@ -377,7 +390,7 @@
         });
     }
 
-    // ─── 章节详情页逻辑（单章快速下载）─────────────────────────────────
+    // ─── 章节详情页逻辑 ─────────────────────────────────
     function initChapterPageUI() {
         const fab = document.createElement('button');
         fab.textContent = '📦 下载本章CBZ';
@@ -429,11 +442,9 @@
                 statusBar.textContent = `图片下载中 ${done}/${imgUrls.length}...`;
             });
 
-            // 打包时显示百分比，不再是静态文字
             statusBar.textContent = '正在打包 CBZ... 0%';
-            const cbzBlob = await packCbz(buffers, imgUrls, (meta) => {
-                const pct = Math.round(meta.percent);
-                statusBar.textContent = `正在打包 CBZ... ${pct}%`;
+            const cbzBlob = await packCbz(buffers, imgUrls, ({ percent }) => {
+                statusBar.textContent = `正在打包 CBZ... ${percent}%`;
             });
             downloadBlob(cbzBlob, cbzName);
 
