@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         nnhm7 漫画CBZ下载器
 // @namespace    https://nnhm7.org/
-// @version      1.2
+// @version      1.3
 // @description  在 nnhm7.org 章节列表页批量下载漫画章节为CBZ格式（兼容 Komga 等本地漫画服务器）
 // @author       zwy
 // @match        https://nnhm7.org/comic/*
@@ -149,38 +149,78 @@
         return results;
     }
 
-    // ─── 打包为 CBZ ───────────────────────────────────────────────────
-    // 说明：JSZip STORE 模式下内置 onUpdate 几乎不会触发（没有压缩计算过程）
-    // 改用自制进度：先分批异步将图片加入 zip，再 generateAsync
-    async function packCbz(imageBuffers, imageUrls, onPackProgress) {
-        const zip = new JSZip();
-        const total = imageBuffers.length;
-        let added = 0;
+    // ─── 打包为 CBZ（Web Worker 方案，彻底解决卡在50%问题）────────────
+    // 根本原因：JSZip generateAsync 在 STORE 模式下阻塞主线程，
+    // onUpdate 回调基本不触发，进度条假死在 50%。
+    // 解决方案：通过 Blob URL 动态创建 Web Worker，把 JSZip 打包完全
+    // 移到 Worker 线程，主线程靠 postMessage 实时收进度更新。
+    function packCbzInWorker(imageBuffers, imageUrls, onPackProgress) {
+        return new Promise((resolve, reject) => {
+            const workerSrc = `
+self.importScripts('https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js');
 
-        // 分批加入文件，每 20 张让出一次主线程，避免 UI 冻结
-        for (let i = 0; i < total; i++) {
-            const buf = imageBuffers[i];
-            if (buf) {
-                const ext = (imageUrls[i].match(/\.(jpe?g|png|webp|gif)$/i) || ['','jpg'])[1].toLowerCase();
-                zip.file(`${String(i + 1).padStart(4, '0')}.${ext}`, buf);
-            }
-            added++;
-            if (added % 20 === 0 || added === total) {
-                const pct = Math.round(added / total * 50); // 前 50% 给加文件阶段
-                onPackProgress && onPackProgress({ percent: pct });
-                await sleep(0); // 让出主线程
-            }
+self.onmessage = async function(e) {
+    const { buffers, urls } = e.data;
+    const zip = new JSZip();
+    const total = buffers.length;
+
+    // 阶段1：逐张添加文件，每10张 postMessage 一次进度（占 0~40%）
+    for (let i = 0; i < total; i++) {
+        const buf = buffers[i];
+        if (buf) {
+            const m = urls[i].match(/\\.(jpe?g|png|webp|gif)(\\?|$)/i);
+            const ext = m ? m[1].toLowerCase() : 'jpg';
+            zip.file(String(i + 1).padStart(4, '0') + '.' + ext, buf);
         }
+        if ((i + 1) % 10 === 0 || i === total - 1) {
+            self.postMessage({ type: 'progress', percent: Math.round((i + 1) / total * 40) });
+        }
+    }
 
-        // generateAsync 阶段占后 50%
-        // 用 streamFiles:true 使 JSZip 分块处理，配合 onUpdate 触发
-        return await zip.generateAsync(
-            { type: 'blob', compression: 'STORE', streamFiles: true },
-            (meta) => {
-                const pct = 50 + Math.round(meta.percent / 2); // 50~100%
-                onPackProgress && onPackProgress({ percent: pct });
+    // 阶段2：generateAsync，STORE模式极快，onUpdate 会频繁触发（占 40~100%）
+    try {
+        const blob = await zip.generateAsync(
+            { type: 'blob', compression: 'STORE' },
+            function(meta) {
+                self.postMessage({ type: 'progress', percent: 40 + Math.round(meta.percent * 0.6) });
             }
         );
+        self.postMessage({ type: 'done', blob });
+    } catch(err) {
+        self.postMessage({ type: 'error', message: err.message });
+    }
+};
+`;
+            const workerBlob = new Blob([workerSrc], { type: 'application/javascript' });
+            const workerUrl = URL.createObjectURL(workerBlob);
+            const worker = new Worker(workerUrl);
+
+            worker.onmessage = function(e) {
+                const msg = e.data;
+                if (msg.type === 'progress') {
+                    onPackProgress && onPackProgress({ percent: msg.percent });
+                } else if (msg.type === 'done') {
+                    worker.terminate();
+                    URL.revokeObjectURL(workerUrl);
+                    resolve(msg.blob);
+                } else if (msg.type === 'error') {
+                    worker.terminate();
+                    URL.revokeObjectURL(workerUrl);
+                    reject(new Error(msg.message));
+                }
+            };
+
+            worker.onerror = function(e) {
+                worker.terminate();
+                URL.revokeObjectURL(workerUrl);
+                reject(new Error('Worker 错误: ' + e.message));
+            };
+
+            // ArrayBuffer 以 Transferable 方式传入 Worker（零拷贝，速度更快）
+            const validBuffers = imageBuffers.map(b => b || null);
+            const transferList = validBuffers.filter(Boolean);
+            worker.postMessage({ buffers: validBuffers, urls: imageUrls }, transferList);
+        });
     }
 
     // ─── UI 工具 ──────────────────────────────────────────────────────
@@ -212,7 +252,7 @@
 
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📦 漫画CBZ下载器 <span style="font-size:11px;color:#9ca3af">v1.2</span></strong>
+  <strong style="font-size:15px">📦 漫画CBZ下载器 <span style="font-size:11px;color:#9ca3af">v1.3</span></strong>
   <span id="cbzClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 
@@ -359,7 +399,7 @@
                     if (failedImgs > 0) log(`  ⚠ ${failedImgs} 张图片下载失败，已跳过`, '#d97706');
 
                     $('cbzImgProgress').textContent = '  打包 CBZ 中... 0%';
-                    const cbzBlob = await packCbz(imgBuffers, imgUrls, ({ percent }) => {
+                    const cbzBlob = await packCbzInWorker(imgBuffers, imgUrls, ({ percent }) => {
                         $('cbzImgProgress').textContent = `  打包 CBZ 中... ${percent}%`;
                     });
                     downloadBlob(cbzBlob, cbzName);
@@ -443,7 +483,7 @@
             });
 
             statusBar.textContent = '正在打包 CBZ... 0%';
-            const cbzBlob = await packCbz(buffers, imgUrls, ({ percent }) => {
+            const cbzBlob = await packCbzInWorker(buffers, imgUrls, ({ percent }) => {
                 statusBar.textContent = `正在打包 CBZ... ${percent}%`;
             });
             downloadBlob(cbzBlob, cbzName);
