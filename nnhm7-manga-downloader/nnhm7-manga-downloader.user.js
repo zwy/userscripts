@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         nnhm7 漫画CBZ下载器
 // @namespace    https://nnhm7.org/
-// @version      1.0
+// @version      1.1
 // @description  在 nnhm7.org 章节列表页批量下载漫画章节为CBZ格式（兼容 Komga 等本地漫画服务器）
 // @author       zwy
 // @match        https://nnhm7.org/comic/*
@@ -49,7 +49,6 @@
         return str.replace(/[\\/:*?"<>|]/g, '_').trim().substring(0, 100);
     }
 
-    // 从章节名提取编号用于文件名排序，如「第35話」→ "035"
     function extractChapterNum(name) {
         const m = name.match(/(\d+)/);
         return m ? String(parseInt(m[1])).padStart(4, '0') : '0000';
@@ -65,8 +64,6 @@
     }
 
     // ─── 页面类型判断 ─────────────────────────────────────────────────
-    // 章节列表页：/comic/xxx.html
-    // 章节详情页：/comic/xxx/chapter-xxx.html
     const isChapterList = /\/comic\/[^/]+\.html/.test(location.pathname);
     const isChapterPage = /\/comic\/[^/]+\/chapter-/.test(location.pathname);
 
@@ -80,7 +77,6 @@
             const url = href.startsWith('http') ? href : BASE + href;
             items.push({ index: i, name, url });
         });
-        // 列表默认倒序（最新在前），反转为正序
         return items.reverse();
     }
 
@@ -137,7 +133,7 @@
         });
     }
 
-    // 并发下载一批图片（控制并发数）
+    // 并发下载图片
     async function fetchImagesWithConcurrency(urls, onProgress) {
         const results = new Array(urls.length);
         let cursor = 0;
@@ -147,7 +143,7 @@
                 try {
                     results[idx] = await fetchImage(urls[idx]);
                 } catch(e) {
-                    results[idx] = null; // 失败占位
+                    results[idx] = null;
                 }
                 onProgress(idx);
                 await sleep(CONFIG.imgDelay);
@@ -157,8 +153,8 @@
         return results;
     }
 
-    // ─── 打包为 CBZ ───────────────────────────────────────────────────
-    async function packCbz(imageBuffers, imageUrls) {
+    // ─── 打包为 CBZ（带打包进度回调）────────────────────────────────────
+    async function packCbz(imageBuffers, imageUrls, onPackProgress) {
         const zip = new JSZip();
         imageBuffers.forEach((buf, i) => {
             if (!buf) return;
@@ -166,14 +162,16 @@
             const filename = `${String(i + 1).padStart(4, '0')}.${ext}`;
             zip.file(filename, buf);
         });
-        return await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+        return await zip.generateAsync(
+            { type: 'blob', compression: 'STORE' },
+            onPackProgress  // JSZip 原生进度回调：{ percent, currentFile }
+        );
     }
 
     // ─── UI 工具 ──────────────────────────────────────────────────────
     function $(id) { return document.getElementById(id); }
 
     function createFabAndPanel() {
-        // 浮动按钮
         const fab = document.createElement('button');
         fab.id = 'cbzFab';
         fab.textContent = '📦 下载漫画';
@@ -187,7 +185,6 @@
         fab.onmouseenter = () => fab.style.background = '#6d28d9';
         fab.onmouseleave = () => fab.style.background = '#7c3aed';
 
-        // 面板
         const panel = document.createElement('div');
         panel.id = 'cbzPanel';
         Object.assign(panel.style, {
@@ -200,19 +197,17 @@
 
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📦 漫画CBZ下载器 <span style="font-size:11px;color:#9ca3af">v1.0</span></strong>
+  <strong style="font-size:15px">📦 漫画CBZ下载器 <span style="font-size:11px;color:#9ca3af">v1.1</span></strong>
   <span id="cbzClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 
 <div id="cbzInfo" style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
 
-<!-- 文件名前缀 -->
 <div style="margin-bottom:10px">
   <label style="font-size:12px;color:#555;display:block;margin-bottom:4px">CBZ 文件名前缀（留空则自动用章节名）：</label>
   <input id="cbzPrefix" type="text" placeholder="例如：第001話  留空自动" style="width:100%;padding:6px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:13px">
 </div>
 
-<!-- 范围 -->
 <p style="margin:0 0 6px;font-weight:bold;color:#555">下载范围：</p>
 <div style="display:flex;gap:12px;margin-bottom:6px">
   <label><input type="radio" name="cbzRange" value="all" checked> 全部章节</label>
@@ -226,7 +221,6 @@
   <span>章</span>
 </div>
 
-<!-- 间隔 -->
 <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">
   <span style="color:#555">章节间隔：</span>
   <input id="cbzDelay" type="number" min="500" max="10000" value="1200" style="width:68px;padding:4px;border:1px solid #ddd;border-radius:4px">
@@ -248,7 +242,6 @@
   <div style="background:#e5e7eb;border-radius:999px;height:8px;overflow:hidden;margin-bottom:8px">
     <div id="cbzProgressBar" style="height:100%;width:0%;background:#7c3aed;transition:width 0.3s;border-radius:999px"></div>
   </div>
-  <!-- 当前章节图片进度 -->
   <div id="cbzImgProgress" style="font-size:11px;color:#9ca3af;margin-bottom:6px"></div>
   <div id="cbzLog" style="height:140px;overflow-y:auto;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:8px;font-size:11px;color:#555;font-family:monospace;line-height:1.6"></div>
 </div>`;
@@ -332,20 +325,17 @@
                 $('cbzImgProgress').textContent = '';
                 log(`↓ [${i+1}/${targets.length}] ${ch.name}`);
 
-                // 生成 CBZ 文件名
                 const prefix = $('cbzPrefix').value.trim();
                 const cbzName = prefix
                     ? `${safeFileName(prefix)}_${extractChapterNum(ch.name)}.cbz`
                     : `${safeFileName(mangaTitle)}_${extractChapterNum(ch.name)}_${safeFileName(ch.name)}.cbz`;
 
                 try {
-                    // 1. 抓取图片 URL 列表
                     const imgUrls = await fetchChapterImageUrls(ch.url);
                     log(`  📷 共 ${imgUrls.length} 张图片`);
 
-                    // 2. 并发下载图片（带进度）
                     let doneImgs = 0;
-                    const imgBuffers = await fetchImagesWithConcurrency(imgUrls, (idx) => {
+                    const imgBuffers = await fetchImagesWithConcurrency(imgUrls, () => {
                         doneImgs++;
                         $('cbzImgProgress').textContent = `  图片进度: ${doneImgs}/${imgUrls.length}`;
                     });
@@ -353,8 +343,12 @@
                     const failedImgs = imgBuffers.filter(b => !b).length;
                     if (failedImgs > 0) log(`  ⚠ ${failedImgs} 张图片下载失败，已跳过`, '#d97706');
 
-                    // 3. 打包 CBZ
-                    const cbzBlob = await packCbz(imgBuffers, imgUrls);
+                    // 打包时显示打包进度
+                    $('cbzImgProgress').textContent = '  打包 CBZ 中... 0%';
+                    const cbzBlob = await packCbz(imgBuffers, imgUrls, (meta) => {
+                        const pct = Math.round(meta.percent);
+                        $('cbzImgProgress').textContent = `  打包 CBZ 中... ${pct}%`;
+                    });
                     downloadBlob(cbzBlob, cbzName);
 
                     successCount++;
@@ -406,13 +400,11 @@
         document.body.appendChild(fab);
         document.body.appendChild(statusBar);
 
-        // 从当前页面直接提取图片
         function getLocalImages() {
             return Array.from(document.querySelectorAll('.view-imgBox img[data-original], #m_r_imgbox_0 img[data-original]'))
                 .map(img => img.getAttribute('data-original')).filter(Boolean);
         }
 
-        // 获取当前章节名
         function getChapterTitle() {
             const el = document.querySelector('.view-title, .read-title, h1');
             return el ? el.textContent.trim() : document.title.split('-')[0].trim();
@@ -437,8 +429,12 @@
                 statusBar.textContent = `图片下载中 ${done}/${imgUrls.length}...`;
             });
 
-            statusBar.textContent = '正在打包 CBZ...';
-            const cbzBlob = await packCbz(buffers, imgUrls);
+            // 打包时显示百分比，不再是静态文字
+            statusBar.textContent = '正在打包 CBZ... 0%';
+            const cbzBlob = await packCbz(buffers, imgUrls, (meta) => {
+                const pct = Math.round(meta.percent);
+                statusBar.textContent = `正在打包 CBZ... ${pct}%`;
+            });
             downloadBlob(cbzBlob, cbzName);
 
             statusBar.textContent = `✅ 完成：${cbzName}  (${(cbzBlob.size/1024/1024).toFixed(1)} MB)`;
