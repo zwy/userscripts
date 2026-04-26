@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         论坛 GIF 批量下载器
 // @namespace    https://github.com/zwy/userscripts
-// @version      1.3
+// @version      1.4
 // @description  在论坛列表页批量进入详情页，提取并下载正文中的 GIF 图片，支持去重、黑名单/白名单
 // @author       zwy
 // @match        *://*.e6042m9.cc/*
@@ -43,6 +43,28 @@
     // ─── 工具 ─────────────────────────────────────────────────────────
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+    // ─── URL 解析工具 ───────────────────────────────────────────────────
+    //
+    // 核心修复：用 new URL(href, base) 解析所有链接。
+    // 原因：手动字符串拼接会丢失端口号（:2096），
+    // 并且若 href 带有 http:// 则不会自动升级到 https://。
+    // new URL() 会完整保留协议+域名+端口，
+    // 并最终强制将协议升级到和当前页面一致。
+    //
+    function resolveUrl(href, base) {
+        try {
+            const resolved = new URL(href, base);
+            // 强制协议升级：如果当前页面是 https，则将解析结果也升级为 https
+            // 防止混合内容错误（Mixed Content）
+            if (location.protocol === 'https:' && resolved.protocol === 'http:') {
+                resolved.protocol = 'https:';
+            }
+            return resolved.href;
+        } catch (e) {
+            return null;
+        }
+    }
+
     // ─── 持久化存储 ──────────────────────────────────────────────────
     function getDownloadedSet() { try { return new Set(JSON.parse(GM_getValue('gif_downloaded', '[]'))); } catch (e) { return new Set(); } }
     function saveDownloadedSet(set) { GM_setValue('gif_downloaded', JSON.stringify([...set])); }
@@ -62,38 +84,29 @@
     }
 
     function gifFilenameFromUrl(url) {
-        try { const p = new URL(url, location.href).pathname.split('/'); return decodeURIComponent(p[p.length - 1] || 'unnamed.gif'); }
+        try { const p = new URL(url).pathname.split('/'); return decodeURIComponent(p[p.length - 1] || 'unnamed.gif'); }
         catch (e) { return url.split('/').pop().split('?')[0] || 'unnamed.gif'; }
     }
 
     function isDecorativeGif(url) { return CONFIG.skipUrlKeywords.some(kw => url.toLowerCase().includes(kw)); }
 
-    // ─── 抓取页面 HTML（优先用 fetch + credentials，绕过 CDN 鉴权）─────────────────
-    //
-    // 为什么用 fetch：
-    //   - fetch 在页面上下文中运行，自动携带当前站点的 Cookie 和 Session
-    //   - CDN 看到的请求和真实用户在浏览器里点链接一样，无法区分
-    //   - GM_xmlhttpRequest 不携带页面 Cookie，会被 CDN 识别为异常请求（返回 530）
-    //
-    // 注意：fetch 不能跨域，但此处详情页和列表页是同域名，可以直接使用。
-    // GIF 图片下载如果也是同域名则用 fetch，如果是外域 CDN 则用 GM_xmlhttpRequest。
-    //
+    // ─── 抓取页面 HTML（fetch + credentials 携带 Cookie，绕过 CDN 鉴权）────────────────
     async function fetchPage(url, retry = 0) {
         try {
-            const resp = await fetch(url, {
+            // 请求前再次确认 URL 为 https（安全网。防止拼接阶段遗漏的 http 链接）
+            const safeUrl = location.protocol === 'https:' ? url.replace(/^http:/, 'https:') : url;
+            const resp = await fetch(safeUrl, {
                 method: 'GET',
-                credentials: 'include',      // 携带完整 Cookie
+                credentials: 'include',
                 headers: {
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
                 },
-                // 只跟同站跨域跳转，防止被引导到拦截页
                 redirect: 'follow',
             });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            // 检测是否返回了 CDN 拦截页（530/522 错误页内容包含特定标志）
             const text = await resp.text();
-            if (text.includes('Error 530') || text.includes('\u57df名未配置') || text.includes('CDN节点')) {
+            if (text.includes('Error 530') || text.includes('域名未配置') || text.includes('CDN节点')) {
                 throw new Error('CDN拦截页 (530)，页面可能需登录或处于不同域名');
             }
             return text;
@@ -118,7 +131,9 @@
         for (const img of root.querySelectorAll('img')) {
             const src = img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('file') || '';
             if (!src || !src.toLowerCase().includes('.gif') || isDecorativeGif(src)) continue;
-            try { gifs.push(src.startsWith('http') ? src : new URL(src, pageUrl).href); } catch (e) {}
+            // 使用 resolveUrl 确保 GIF 链接也不会有协议问题
+            const absUrl = resolveUrl(src, pageUrl);
+            if (absUrl) gifs.push(absUrl);
         }
         return { gifs, isFullBody: !contentEl, hitSelector };
     }
@@ -132,12 +147,10 @@
         try {
             let blob;
             if (isSameOrigin(url)) {
-                // 同域：用 fetch + credentials，自动携带 Cookie
                 const resp = await fetch(url, { credentials: 'include' });
                 if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
                 blob = await resp.blob();
             } else {
-                // 跨域（如外部 CDN 图片）：用 GM_xmlhttpRequest
                 blob = await new Promise((resolve, reject) => {
                     GM_xmlhttpRequest({
                         method: 'GET', url, responseType: 'blob',
@@ -160,7 +173,7 @@
 
     // ─── 从列表页提取帖子链接 ─────────────────────────────────────────
     function extractDetailLinks() {
-        const seen = new Set(), links = [], BASE = location.origin;
+        const seen = new Set(), links = [];
         let hitSel = '';
         for (const sel of CONFIG.listItemSelectors) {
             try {
@@ -169,8 +182,11 @@
                 nodes.forEach(a => {
                     const href = a.getAttribute('href');
                     if (!href || href === '#' || /login|register|logout|page=|&page|search/i.test(href)) return;
-                    const url = href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '');
-                    if (!seen.has(url)) { seen.add(url); links.push({ url, title: a.textContent.trim().replace(/\s+/g, ' ').substring(0, 60) || '未知标题' }); }
+                    // 使用 resolveUrl：自动保留协议+域名+端口，并升级 http 到 https
+                    const url = resolveUrl(href, location.href);
+                    if (!url || seen.has(url)) return;
+                    seen.add(url);
+                    links.push({ url, title: a.textContent.trim().replace(/\s+/g, ' ').substring(0, 60) || '未知标题' });
                 });
                 if (links.length) { hitSel = sel; break; }
             } catch (e) {}
@@ -210,7 +226,7 @@
 
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.3</span></strong>
+  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.4</span></strong>
   <span id="gifClose" style="cursor:pointer;font-size:20px;color:#9ca3af">✕</span>
 </div>
 
@@ -398,7 +414,7 @@
     }
 
     // ─── 入口 ─────────────────────────────────────────────────────────
-    console.log(`[GIF下载器 v1.3] 已加载 | ${location.href} | isListPage: ${isListPage}`);
+    console.log(`[GIF下载器 v1.4] 已加载 | ${location.href} | isListPage: ${isListPage}`);
     if (isListPage) initListPage();
 
 })();
