@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         论坛 GIF 批量下载器
 // @namespace    https://github.com/zwy/userscripts
-// @version      1.0
+// @version      1.1
 // @description  在论坛列表页批量进入详情页，提取并下载正文中的 GIF 图片，支持去重、黑名单/白名单
 // @author       zwy
-// @match        https://12310.e6042m9.cc:2096/pw/*
+// @match        https://12310.e6042m9.cc:2096/*
+// @match        https://12310.e6042m9.cc/*
+// @include      /^https?:\/\/12310\.e6042m9\.cc(:\d+)?\//
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -20,14 +22,22 @@
 
     // ─── 配置（页面结构不符时只需修改这里）──────────────────────────────
     const CONFIG = {
-        // 列表页：提取帖子详情页链接的选择器
-        // 默认匹配 href 中含 html_data 的链接（与目标站 URL 格式一致）
-        listItemSelector: 'a[href*="html_data"]',
+        // 列表页：提取帖子详情页链接的选择器（多个选择器用逗号分隔，依次尝试）
+        // PW 论坛帖子标题链接通常是 read-htm-tid-XXX 格式
+        // html_data 是详情页本身的路径，列表页中的 <a> href 可能两种都有
+        listItemSelectors: [
+            'a[href*="html_data"]',       // 直接链向详情页内容
+            'a[href*="read-htm-tid"]',    // 标准 PW 帖子链接格式
+            'a[href*="read.php"]',        // 老版 PW 格式
+            '.threadlist a[href]',        // 帖子列表容器内所有链接
+            'td.folder a[href]',          // 常见论坛表格列表
+            'h3 a[href], h4 a[href]',     // 标题标签内链接
+            '.subject a[href]',           // 主题列
+        ],
 
         // 详情页：正文容器选择器（GIF 只从这个容器内提取）
         // 多个选择器用逗号分隔，从左到右依次尝试，第一个命中的为准
-        // 如果全部未命中，自动 fallback 到 body 并在日志中给出警告
-        contentSelector: '.t_msgfont, .read-message, .postmessage, .post_message, .message, .threadtext, [id^="postmessage_"]',
+        contentSelector: '.t_msgfont, .read-message, .postmessage, .post_message, .message, .threadtext, [id^="postmessage_"], td.t_f, .post-content, .content',
 
         // 详情页抓取间隔（ms），避免频繁请求
         pageDelay: 1500,
@@ -75,25 +85,18 @@
     function saveWhitelist(arr) { GM_setValue('gif_whitelist', JSON.stringify(arr)); }
 
     // ─── 去重判断 ─────────────────────────────────────────────────────
-    // 返回 { skip: bool, reason: string }
     function shouldSkip(filename) {
         const downloaded = getDownloadedSet();
         const blacklist  = getBlacklist();
         const whitelist  = getWhitelist();
         const lower      = filename.toLowerCase();
 
-        // 黑名单优先：永不下载
         if (blacklist.some(kw => kw && lower.includes(kw.toLowerCase())))
             return { skip: true, reason: '黑名单' };
-
-        // 白名单：强制下载，无视去重记录
         if (whitelist.some(kw => kw && lower.includes(kw.toLowerCase())))
             return { skip: false, reason: '白名单(强制)' };
-
-        // 普通去重
         if (downloaded.has(filename))
             return { skip: true, reason: '已下载' };
-
         return { skip: false, reason: '' };
     }
 
@@ -119,12 +122,12 @@
             GM_xmlhttpRequest({
                 method: 'GET',
                 url,
-                headers: { 'Referer': location.origin, 'User-Agent': navigator.userAgent },
+                headers: { 'Referer': location.href, 'User-Agent': navigator.userAgent },
                 onload(resp) {
                     if (resp.status !== 200) return doRetry(new Error(`HTTP ${resp.status}`));
                     resolve(resp.responseText);
                 },
-                onerror() { doRetry(new Error('网络错误')); }
+                onerror(e) { doRetry(new Error('网络错误: ' + (e.error || ''))); }
             });
             function doRetry(err) {
                 if (retry < CONFIG.retryMax)
@@ -138,12 +141,12 @@
     function extractGifsFromHtml(html, pageUrl) {
         const doc = new DOMParser().parseFromString(html, 'text/html');
 
-        // 依次尝试各正文选择器
         let contentEl = null;
+        let hitSelector = '';
         for (const sel of CONFIG.contentSelector.split(',').map(s => s.trim())) {
             try {
                 const el = doc.querySelector(sel);
-                if (el) { contentEl = el; break; }
+                if (el) { contentEl = el; hitSelector = sel; break; }
             } catch (e) { /* 无效选择器跳过 */ }
         }
 
@@ -155,15 +158,18 @@
             const src = img.getAttribute('src')
                 || img.getAttribute('data-src')
                 || img.getAttribute('data-original')
+                || img.getAttribute('file')
                 || '';
             if (!src) continue;
             if (!src.toLowerCase().includes('.gif')) continue;
             if (isDecorativeGif(src)) continue;
-            const absUrl = src.startsWith('http') ? src : new URL(src, pageUrl).href;
-            gifs.push(absUrl);
+            try {
+                const absUrl = src.startsWith('http') ? src : new URL(src, pageUrl).href;
+                gifs.push(absUrl);
+            } catch (e) { /* 非法 URL 跳过 */ }
         }
 
-        return { gifs, isFullBody };
+        return { gifs, isFullBody, hitSelector };
     }
 
     // ─── 下载单个 GIF ────────────────────────────────────────────────
@@ -191,21 +197,43 @@
         });
     }
 
-    // ─── 从列表页提取所有详情页链接（去重）──────────────────────────
+    // ─── 从列表页提取所有详情页链接（多选择器 + 去重）────────────────
     function extractDetailLinks() {
         const seen = new Set();
         const links = [];
-        document.querySelectorAll(CONFIG.listItemSelector).forEach(a => {
-            const href = a.getAttribute('href');
-            if (!href) return;
-            const url = href.startsWith('http') ? href : location.origin + '/' + href.replace(/^\//, '');
-            if (!seen.has(url)) {
-                seen.add(url);
-                links.push({ url, title: a.textContent.trim().substring(0, 60) || '未知标题' });
-            }
-        });
+        const BASE = location.origin;
+
+        // 依次尝试各选择器，取第一个有结果的
+        let hitSel = '';
+        for (const sel of CONFIG.listItemSelectors) {
+            try {
+                const nodes = document.querySelectorAll(sel);
+                if (!nodes.length) continue;
+                nodes.forEach(a => {
+                    const href = a.getAttribute('href');
+                    if (!href || href === '#') return;
+                    // 排除分页、登录、注册等非内容链接
+                    if (/login|register|logout|page=|&page|search/i.test(href)) return;
+                    const url = href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '');
+                    if (!seen.has(url)) {
+                        seen.add(url);
+                        links.push({ url, title: a.textContent.trim().replace(/\s+/g, ' ').substring(0, 60) || '未知标题' });
+                    }
+                });
+                if (links.length) { hitSel = sel; break; }
+            } catch (e) { /* 无效选择器跳过 */ }
+        }
+
+        console.log(`[GIF下载器] listItemSelector 命中: "${hitSel}"，找到 ${links.length} 个链接`);
         return links;
     }
+
+    // ─── 页面类型判断 ─────────────────────────────────────────────────
+    // 列表页：URL 含 thread-htm 或 fid 参数
+    const path = location.pathname + location.search;
+    const isListPage    = /thread-htm/.test(path) || /[?&]fid=/.test(path);
+    // 详情页：URL 含 html_data 或 read-htm-tid
+    const isDetailPage  = /html_data/.test(path) || /read-htm-tid/.test(path);
 
     // ─── UI：创建悬浮按钮 + 控制面板 ─────────────────────────────────
     function createUI() {
@@ -226,7 +254,7 @@
         panel.id = 'gifPanel';
         Object.assign(panel.style, {
             display: 'none', position: 'fixed', bottom: '80px', left: '24px',
-            zIndex: '99998', width: '380px', background: '#fff', color: '#333',
+            zIndex: '99998', width: '400px', background: '#fff', color: '#333',
             borderRadius: '12px', boxShadow: '0 8px 32px rgba(0,0,0,0.25)',
             padding: '20px', fontFamily: 'system-ui,sans-serif', fontSize: '14px',
             maxHeight: '88vh', overflowY: 'auto'
@@ -234,11 +262,18 @@
 
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.0</span></strong>
+  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.1</span></strong>
   <span id="gifClose" style="cursor:pointer;font-size:20px;color:#9ca3af">✕</span>
 </div>
 
-<div id="gifInfo" style="background:#ecfeff;border:1px solid #a5f3fc;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px;color:#0e7490"></div>
+<div id="gifInfo" style="background:#ecfeff;border:1px solid #a5f3fc;border-radius:6px;padding:10px;margin-bottom:10px;line-height:1.8;font-size:13px;color:#0e7490"></div>
+
+<!-- 诊断区：显示找到的链接样本 -->
+<details id="gifDebugWrap" style="margin-bottom:12px;font-size:12px">
+  <summary style="cursor:pointer;color:#6b7280;user-select:none">🔍 诊断：查看识别到的帖子链接</summary>
+  <div id="gifDebugLinks" style="margin-top:6px;max-height:120px;overflow-y:auto;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;color:#374151;line-height:1.6"></div>
+  <div style="margin-top:6px;font-size:11px;color:#9ca3af">若此处为空，说明列表选择器未命中，请按 F12 查看帖子 &lt;a&gt; 的 href 格式，反馈给开发者</div>
+</details>
 
 <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:12px">
   <div style="font-weight:bold;font-size:13px;margin-bottom:8px;color:#374151">去重设置</div>
@@ -295,11 +330,9 @@
         let isRunning = false, shouldStop = false;
         let successCount = 0, skipCount = 0, failCount = 0;
 
-        // 初始化黑白名单输入框
         $('gifBlacklist').value = getBlacklist().join('\n');
         $('gifWhitelist').value = getWhitelist().join('\n');
 
-        // blur 时自动持久化
         $('gifBlacklist').addEventListener('blur', () =>
             saveBlacklist($('gifBlacklist').value.split('\n').map(s => s.trim()).filter(Boolean)));
         $('gifWhitelist').addEventListener('blur', () =>
@@ -318,6 +351,16 @@
                 `<b>当前页帖子数：</b>${links.length} 个<br>` +
                 `<b>已下载记录：</b>${getDownloadedSet().size} 个 GIF<br>` +
                 `<b>黑名单：</b>${getBlacklist().length} 条 &nbsp; <b>白名单：</b>${getWhitelist().length} 条`;
+
+            // 填充诊断区
+            const debugEl = $('gifDebugLinks');
+            if (links.length === 0) {
+                debugEl.innerHTML = '<span style="color:#ef4444">⚠ 未识别到任何帖子链接，请展开此区域查看详情并反馈</span>';
+            } else {
+                debugEl.innerHTML = links.slice(0, 10).map(l =>
+                    `<div title="${l.url}">• ${l.title}<br><span style="color:#9ca3af">${l.url.substring(0, 80)}</span></div>`
+                ).join('') + (links.length > 10 ? `<div style="color:#9ca3af">...还有 ${links.length - 10} 个</div>` : '');
+            }
         }
 
         $('gifClearHistory').addEventListener('click', () => {
@@ -346,13 +389,12 @@
         $('gifStart').addEventListener('click', async () => {
             if (isRunning) return;
 
-            // 保存最新黑白名单
             saveBlacklist($('gifBlacklist').value.split('\n').map(s => s.trim()).filter(Boolean));
             saveWhitelist($('gifWhitelist').value.split('\n').map(s => s.trim()).filter(Boolean));
 
             const links = extractDetailLinks();
             if (!links.length) {
-                alert('未在当前页找到帖子链接，请检查 CONFIG.listItemSelector');
+                alert('未识别到帖子链接！\n请点击面板中的「诊断」区域查看详情，或按 F12 查看控制台输出');
                 return;
             }
 
@@ -381,10 +423,13 @@
 
                 try {
                     const html = await fetchPage(url);
-                    const { gifs, isFullBody } = extractGifsFromHtml(html, url);
+                    const { gifs, isFullBody, hitSelector } = extractGifsFromHtml(html, url);
 
-                    if (isFullBody)
-                        log('  ⚠ 未命中正文选择器，已 fallback 到 body，建议检查 CONFIG.contentSelector', '#d97706');
+                    if (isFullBody) {
+                        log('  ⚠ 未命中正文选择器，已 fallback 到 body，建议按 F12 查看正文 class 并更新 CONFIG.contentSelector', '#d97706');
+                    } else {
+                        log(`  📌 正文选择器命中: ${hitSelector}`);
+                    }
 
                     if (!gifs.length) {
                         log('  ⚪ 未找到 GIF，跳过', '#9ca3af');
@@ -446,9 +491,8 @@
         });
     }
 
-    // ─── 入口：列表页特征判断 ─────────────────────────────────────────
-    // 列表页 URL 含 thread-htm（如 thread-htm-fid-3-type-17.html）
-    const isListPage = /thread-htm/.test(location.pathname);
+    // ─── 入口 ─────────────────────────────────────────────────────────
+    console.log(`[GIF下载器] 已加载，URL: ${location.href}，isListPage: ${isListPage}，isDetailPage: ${isDetailPage}`);
 
     if (isListPage) initListPage();
 
