@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         论坛 GIF 批量下载器
 // @namespace    https://github.com/zwy/userscripts
-// @version      1.2
+// @version      1.3
 // @description  在论坛列表页批量进入详情页，提取并下载正文中的 GIF 图片，支持去重、黑名单/白名单
 // @author       zwy
 // @match        *://*.e6042m9.cc/*
@@ -21,9 +21,8 @@
 (function () {
     'use strict';
 
-    // ─── 配置（页面结构不符时只需修改这里）──────────────────────────────
+    // ─── 配置 ──────────────────────────────────────────────────────────
     const CONFIG = {
-        // 列表页：提取帖子详情页链接的选择器（多个选择器依次尝试，第一个有结果的为准）
         listItemSelectors: [
             'a[href*="html_data"]',
             'a[href*="read-htm-tid"]',
@@ -33,10 +32,7 @@
             'h3 a[href], h4 a[href]',
             '.subject a[href]',
         ],
-
-        // 详情页：正文容器选择器（GIF 只从这个容器内提取）
         contentSelector: '.t_msgfont, .read-message, .postmessage, .post_message, .message, .threadtext, [id^="postmessage_"], td.t_f, .post-content, .content',
-
         pageDelay: 1500,
         retryMax: 3,
         retryDelay: 3000,
@@ -44,16 +40,13 @@
         skipUrlKeywords: ['smilies', 'emoji', 'face', 'avatar', 'emo', 'smiley', '/s/', 'attachicons'],
     };
 
-    // ─── 工具 ────────────────────────────────────────────────────────
+    // ─── 工具 ─────────────────────────────────────────────────────────
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    // ─── 持久化存储 ───────────────────────────────────────────────────
-    function getDownloadedSet() {
-        try { return new Set(JSON.parse(GM_getValue('gif_downloaded', '[]'))); } catch (e) { return new Set(); }
-    }
+    // ─── 持久化存储 ──────────────────────────────────────────────────
+    function getDownloadedSet() { try { return new Set(JSON.parse(GM_getValue('gif_downloaded', '[]'))); } catch (e) { return new Set(); } }
     function saveDownloadedSet(set) { GM_setValue('gif_downloaded', JSON.stringify([...set])); }
-    function addToDownloaded(filename) { const s = getDownloadedSet(); s.add(filename); saveDownloadedSet(s); }
-
+    function addToDownloaded(f) { const s = getDownloadedSet(); s.add(f); saveDownloadedSet(s); }
     function getBlacklist() { try { return JSON.parse(GM_getValue('gif_blacklist', '[]')); } catch (e) { return []; } }
     function getWhitelist() { try { return JSON.parse(GM_getValue('gif_whitelist', '[]')); } catch (e) { return []; } }
     function saveBlacklist(arr) { GM_setValue('gif_blacklist', JSON.stringify(arr)); }
@@ -69,34 +62,48 @@
     }
 
     function gifFilenameFromUrl(url) {
+        try { const p = new URL(url, location.href).pathname.split('/'); return decodeURIComponent(p[p.length - 1] || 'unnamed.gif'); }
+        catch (e) { return url.split('/').pop().split('?')[0] || 'unnamed.gif'; }
+    }
+
+    function isDecorativeGif(url) { return CONFIG.skipUrlKeywords.some(kw => url.toLowerCase().includes(kw)); }
+
+    // ─── 抓取页面 HTML（优先用 fetch + credentials，绕过 CDN 鉴权）─────────────────
+    //
+    // 为什么用 fetch：
+    //   - fetch 在页面上下文中运行，自动携带当前站点的 Cookie 和 Session
+    //   - CDN 看到的请求和真实用户在浏览器里点链接一样，无法区分
+    //   - GM_xmlhttpRequest 不携带页面 Cookie，会被 CDN 识别为异常请求（返回 530）
+    //
+    // 注意：fetch 不能跨域，但此处详情页和列表页是同域名，可以直接使用。
+    // GIF 图片下载如果也是同域名则用 fetch，如果是外域 CDN 则用 GM_xmlhttpRequest。
+    //
+    async function fetchPage(url, retry = 0) {
         try {
-            const parts = new URL(url, location.href).pathname.split('/');
-            return decodeURIComponent(parts[parts.length - 1] || 'unnamed.gif');
-        } catch (e) { return url.split('/').pop().split('?')[0] || 'unnamed.gif'; }
-    }
-
-    function isDecorativeGif(url) {
-        const lower = url.toLowerCase();
-        return CONFIG.skipUrlKeywords.some(kw => lower.includes(kw));
-    }
-
-    // ─── 抓取页面 HTML（带重试）──────────────────────────────────────
-    function fetchPage(url, retry = 0) {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: 'GET', url,
-                headers: { 'Referer': location.href, 'User-Agent': navigator.userAgent },
-                onload(resp) {
-                    if (resp.status !== 200) return doRetry(new Error(`HTTP ${resp.status}`));
-                    resolve(resp.responseText);
+            const resp = await fetch(url, {
+                method: 'GET',
+                credentials: 'include',      // 携带完整 Cookie
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
                 },
-                onerror(e) { doRetry(new Error('网络错误: ' + (e.error || ''))); }
+                // 只跟同站跨域跳转，防止被引导到拦截页
+                redirect: 'follow',
             });
-            function doRetry(err) {
-                if (retry < CONFIG.retryMax) setTimeout(() => fetchPage(url, retry + 1).then(resolve).catch(reject), CONFIG.retryDelay);
-                else reject(err);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            // 检测是否返回了 CDN 拦截页（530/522 错误页内容包含特定标志）
+            const text = await resp.text();
+            if (text.includes('Error 530') || text.includes('\u57df名未配置') || text.includes('CDN节点')) {
+                throw new Error('CDN拦截页 (530)，页面可能需登录或处于不同域名');
             }
-        });
+            return text;
+        } catch (err) {
+            if (retry < CONFIG.retryMax) {
+                await sleep(CONFIG.retryDelay);
+                return fetchPage(url, retry + 1);
+            }
+            throw err;
+        }
     }
 
     // ─── 从详情页 HTML 提取正文 GIF ──────────────────────────────────
@@ -116,24 +123,39 @@
         return { gifs, isFullBody: !contentEl, hitSelector };
     }
 
-    // ─── 下载单个 GIF ────────────────────────────────────────────────
-    function downloadGif(url, filename) {
-        return new Promise((resolve) => {
-            GM_xmlhttpRequest({
-                method: 'GET', url, responseType: 'blob',
-                headers: { 'Referer': location.origin },
-                onload(resp) {
-                    if (resp.status !== 200) { resolve({ ok: false, reason: `HTTP ${resp.status}` }); return; }
-                    const a = document.createElement('a');
-                    const objUrl = URL.createObjectURL(resp.response);
-                    a.href = objUrl; a.download = filename;
-                    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-                    setTimeout(() => URL.revokeObjectURL(objUrl), 3000);
-                    resolve({ ok: true });
-                },
-                onerror() { resolve({ ok: false, reason: '网络错误' }); }
-            });
-        });
+    // ─── 下载单个 GIF（同域用 fetch，跨域用 GM_xmlhttpRequest）─────────────
+    function isSameOrigin(url) {
+        try { return new URL(url).origin === location.origin; } catch (e) { return false; }
+    }
+
+    async function downloadGif(url, filename) {
+        try {
+            let blob;
+            if (isSameOrigin(url)) {
+                // 同域：用 fetch + credentials，自动携带 Cookie
+                const resp = await fetch(url, { credentials: 'include' });
+                if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
+                blob = await resp.blob();
+            } else {
+                // 跨域（如外部 CDN 图片）：用 GM_xmlhttpRequest
+                blob = await new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: 'GET', url, responseType: 'blob',
+                        headers: { 'Referer': location.href },
+                        onload(r) { r.status === 200 ? resolve(r.response) : reject(new Error(`HTTP ${r.status}`)); },
+                        onerror() { reject(new Error('网络错误')); }
+                    });
+                });
+            }
+            const a = document.createElement('a');
+            const objUrl = URL.createObjectURL(blob);
+            a.href = objUrl; a.download = filename;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(objUrl), 3000);
+            return { ok: true };
+        } catch (err) {
+            return { ok: false, reason: err.message };
+        }
     }
 
     // ─── 从列表页提取帖子链接 ─────────────────────────────────────────
@@ -188,7 +210,7 @@
 
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.2</span></strong>
+  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.3</span></strong>
   <span id="gifClose" style="cursor:pointer;font-size:20px;color:#9ca3af">✕</span>
 </div>
 
@@ -257,7 +279,6 @@
 
         $('gifBlacklist').value = getBlacklist().join('\n');
         $('gifWhitelist').value = getWhitelist().join('\n');
-
         $('gifBlacklist').addEventListener('blur', () => saveBlacklist($('gifBlacklist').value.split('\n').map(s => s.trim()).filter(Boolean)));
         $('gifWhitelist').addEventListener('blur', () => saveWhitelist($('gifWhitelist').value.split('\n').map(s => s.trim()).filter(Boolean)));
 
@@ -275,13 +296,10 @@
                 `<b>已下载记录：</b>${getDownloadedSet().size} 个 GIF<br>` +
                 `<b>黑名单：</b>${getBlacklist().length} 条 &nbsp; <b>白名单：</b>${getWhitelist().length} 条`;
             const debugEl = $('gifDebugLinks');
-            if (!links.length) {
-                debugEl.innerHTML = '<span style="color:#ef4444">⚠ 未识别到任何帖子链接，请展开查看并反馈</span>';
-            } else {
-                debugEl.innerHTML = links.slice(0, 10).map(l =>
-                    `<div title="${l.url}">• ${l.title}<br><span style="color:#9ca3af">${l.url.substring(0, 80)}</span></div>`
-                ).join('') + (links.length > 10 ? `<div style="color:#9ca3af">...还有 ${links.length - 10} 个</div>` : '');
-            }
+            debugEl.innerHTML = !links.length
+                ? '<span style="color:#ef4444">⚠ 未识别到帖子链接，请展开查看并反馈</span>'
+                : links.slice(0, 10).map(l => `<div title="${l.url}">• ${l.title}<br><span style="color:#9ca3af">${l.url.substring(0, 80)}</span></div>`).join('')
+                  + (links.length > 10 ? `<div style="color:#9ca3af">...还有 ${links.length - 10} 个</div>` : '');
         }
 
         $('gifClearHistory').addEventListener('click', () => {
@@ -290,8 +308,7 @@
         });
 
         function log(msg, color = '#555') {
-            const el = $('gifLog');
-            const d = document.createElement('div');
+            const el = $('gifLog'), d = document.createElement('div');
             d.style.color = color;
             d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
             el.appendChild(d); el.scrollTop = el.scrollHeight;
@@ -314,7 +331,6 @@
 
             const delay = Math.max(500, parseInt($('gifDelay').value) || 1500);
             const dedupEnabled = $('gifDedup').checked;
-
             isRunning = true; shouldStop = false;
             successCount = 0; skipCount = 0; failCount = 0;
             $('gifStart').style.display = 'none';
@@ -357,7 +373,10 @@
                             await sleep(CONFIG.downloadDelay);
                         }
                     }
-                } catch (err) { failCount++; log(`❌ 加载失败 — ${err.message}`, '#ef4444'); }
+                } catch (err) {
+                    failCount++;
+                    log(`❌ 加载失败 — ${err.message}`, '#ef4444');
+                }
 
                 updateProgress(i + 1, links.length);
                 if (i < links.length - 1 && !shouldStop) await sleep(delay);
@@ -379,7 +398,7 @@
     }
 
     // ─── 入口 ─────────────────────────────────────────────────────────
-    console.log(`[GIF下载器 v1.2] 已加载 | ${location.href} | isListPage: ${isListPage}`);
+    console.log(`[GIF下载器 v1.3] 已加载 | ${location.href} | isListPage: ${isListPage}`);
     if (isListPage) initListPage();
 
 })();
