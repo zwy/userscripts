@@ -9,6 +9,7 @@
 | [alicesw 章节导出工具](./alicesw-chapter-exporter/) | alicesw.com | 一键导出书籍章节目录（JSON/CSV/TXT/MD） | [安装](https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-chapter-exporter/alicesw-chapter-exporter.user.js) |
 | [alicesw 小说章节下载器](./alicesw-novel-downloader/) | alicesw.com | 批量下载每章小说正文为TXT，支持番茄小说导入和 Edge TTS 朗读 | [安装](https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js) |
 | [nnhm7 漫画CBZ下载器](./nnhm7-manga-downloader/) | nnhm7.org 及各备用域名 | 批量下载漫画章节为CBZ，兼容 Komga 本地服务器 | [安装](https://raw.githubusercontent.com/zwy/userscripts/main/nnhm7-manga-downloader/nnhm7-manga-downloader.user.js) |
+| [论坛 GIF 批量下载器](./pw-forum-gif-downloader/) | PW 论坛（可配置适配其他站点） | 批量进入帖子详情页提取正文 GIF 并下载，支持去重、黑名单/白名单 | [安装](https://raw.githubusercontent.com/zwy/userscripts/main/pw-forum-gif-downloader/pw-forum-gif-downloader.user.js) |
 
 ## 使用说明
 
