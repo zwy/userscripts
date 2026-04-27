@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         论坛 GIF 批量下载器
 // @namespace    https://github.com/zwy/userscripts
-// @version      1.4
-// @description  在论坛列表页批量进入详情页，提取并下载正文中的 GIF 图片，支持去重、黑名单/白名单
+// @version      1.5
+// @description  在论坛列表页批量进入详情页，提取并下载正文中的 GIF 图片，支持去重、黑名单/白名单、导入/导出记录
 // @author       zwy
 // @match        *://*.e6042m9.cc/*
 // @match        *://e6042m9.cc/*
@@ -44,18 +44,9 @@
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
     // ─── URL 解析工具 ───────────────────────────────────────────────────
-    //
-    // 核心修复：用 new URL(href, base) 解析所有链接。
-    // 原因：手动字符串拼接会丢失端口号（:2096），
-    // 并且若 href 带有 http:// 则不会自动升级到 https://。
-    // new URL() 会完整保留协议+域名+端口，
-    // 并最终强制将协议升级到和当前页面一致。
-    //
     function resolveUrl(href, base) {
         try {
             const resolved = new URL(href, base);
-            // 强制协议升级：如果当前页面是 https，则将解析结果也升级为 https
-            // 防止混合内容错误（Mixed Content）
             if (location.protocol === 'https:' && resolved.protocol === 'http:') {
                 resolved.protocol = 'https:';
             }
@@ -90,10 +81,9 @@
 
     function isDecorativeGif(url) { return CONFIG.skipUrlKeywords.some(kw => url.toLowerCase().includes(kw)); }
 
-    // ─── 抓取页面 HTML（fetch + credentials 携带 Cookie，绕过 CDN 鉴权）────────────────
+    // ─── 抓取页面 HTML ────────────────────────────────────────────────
     async function fetchPage(url, retry = 0) {
         try {
-            // 请求前再次确认 URL 为 https（安全网。防止拼接阶段遗漏的 http 链接）
             const safeUrl = location.protocol === 'https:' ? url.replace(/^http:/, 'https:') : url;
             const resp = await fetch(safeUrl, {
                 method: 'GET',
@@ -131,14 +121,13 @@
         for (const img of root.querySelectorAll('img')) {
             const src = img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('file') || '';
             if (!src || !src.toLowerCase().includes('.gif') || isDecorativeGif(src)) continue;
-            // 使用 resolveUrl 确保 GIF 链接也不会有协议问题
             const absUrl = resolveUrl(src, pageUrl);
             if (absUrl) gifs.push(absUrl);
         }
         return { gifs, isFullBody: !contentEl, hitSelector };
     }
 
-    // ─── 下载单个 GIF（同域用 fetch，跨域用 GM_xmlhttpRequest）─────────────
+    // ─── 下载单个 GIF ─────────────────────────────────────────────────
     function isSameOrigin(url) {
         try { return new URL(url).origin === location.origin; } catch (e) { return false; }
     }
@@ -182,7 +171,6 @@
                 nodes.forEach(a => {
                     const href = a.getAttribute('href');
                     if (!href || href === '#' || /login|register|logout|page=|&page|search/i.test(href)) return;
-                    // 使用 resolveUrl：自动保留协议+域名+端口，并升级 http 到 https
                     const url = resolveUrl(href, location.href);
                     if (!url || seen.has(url)) return;
                     seen.add(url);
@@ -226,7 +214,7 @@
 
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.4</span></strong>
+  <strong style="font-size:15px">🎞 GIF 批量下载器 <span style="font-size:11px;color:#9ca3af">v1.5</span></strong>
   <span id="gifClose" style="cursor:pointer;font-size:20px;color:#9ca3af">✕</span>
 </div>
 
@@ -267,7 +255,11 @@
   <button id="gifStart" style="flex:1;padding:10px;background:#0e7490;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px">▶ 开始下载</button>
   <button id="gifStop" style="flex:0 0 72px;padding:10px;background:#ef4444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;display:none">⏹ 停止</button>
 </div>
-<button id="gifClearHistory" style="width:100%;padding:7px;background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb;border-radius:6px;cursor:pointer;font-size:12px;margin-bottom:10px">🗑 清空已下载记录（重置去重）</button>
+<button id="gifClearHistory" style="width:100%;padding:7px;background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb;border-radius:6px;cursor:pointer;font-size:12px;margin-bottom:6px">🗑 清空已下载记录（重置去重）</button>
+<div style="display:flex;gap:6px;margin-bottom:10px">
+  <button id="gifExport" style="flex:1;padding:7px;background:#f0fdf4;color:#166534;border:1px solid #bbf7d0;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500">📤 导出记录</button>
+  <button id="gifImport" style="flex:1;padding:7px;background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500">📥 导入记录</button>
+</div>
 
 <div id="gifProgressWrap" style="display:none">
   <div style="display:flex;justify-content:space-between;margin-bottom:4px">
@@ -318,17 +310,77 @@
                   + (links.length > 10 ? `<div style="color:#9ca3af">...还有 ${links.length - 10} 个</div>` : '');
         }
 
-        $('gifClearHistory').addEventListener('click', () => {
-            if (!confirm('确定清空所有已下载记录？')) return;
-            saveDownloadedSet(new Set()); refreshInfo(); log('🗑 已清空下载记录', '#6b7280');
-        });
-
         function log(msg, color = '#555') {
             const el = $('gifLog'), d = document.createElement('div');
             d.style.color = color;
             d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
             el.appendChild(d); el.scrollTop = el.scrollHeight;
         }
+
+        // ─── 导出下载记录为 JSON ──────────────────────────────────────
+        function exportRecords() {
+            const downloaded = getDownloadedSet();
+            const data = {
+                version: 1,
+                exported_at: new Date().toISOString(),
+                count: downloaded.size,
+                filenames: Array.from(downloaded)
+            };
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `gif_records_${new Date().toISOString().slice(0, 10)}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            $('gifProgressWrap').style.display = 'block';
+            log(`✅ 已导出 ${downloaded.size} 条记录`, '#059669');
+        }
+
+        // ─── 导入下载记录 ─────────────────────────────────────────────
+        function importRecords() {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json';
+            input.onchange = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                try {
+                    const text = await file.text();
+                    const data = JSON.parse(text);
+                    if (!data.filenames || !Array.isArray(data.filenames)) {
+                        throw new Error('JSON 格式错误：缺少 filenames 字段');
+                    }
+                    const existingSet = getDownloadedSet();
+                    const beforeCount = existingSet.size;
+                    data.filenames.forEach(name => existingSet.add(name));
+                    saveDownloadedSet(existingSet);
+                    const afterCount = existingSet.size;
+                    const imported = afterCount - beforeCount;
+                    $('gifProgressWrap').style.display = 'block';
+                    log(`✅ 导入完成：新增 ${imported} 条记录（总计 ${afterCount}）`, '#059669');
+                    refreshInfo();
+                } catch (err) {
+                    $('gifProgressWrap').style.display = 'block';
+                    log(`❌ 导入失败：${err.message}`, '#ef4444');
+                }
+            };
+            document.body.appendChild(input);
+            input.click();
+            document.body.removeChild(input);
+        }
+
+        $('gifClearHistory').addEventListener('click', () => {
+            if (!confirm('确定清空所有已下载记录？')) return;
+            saveDownloadedSet(new Set()); refreshInfo();
+            $('gifProgressWrap').style.display = 'block';
+            log('🗑 已清空下载记录', '#6b7280');
+        });
+
+        $('gifExport').addEventListener('click', exportRecords);
+        $('gifImport').addEventListener('click', importRecords);
 
         function updateProgress(done, total) {
             const pct = total > 0 ? Math.round(done / total * 100) : 0;
@@ -414,7 +466,7 @@
     }
 
     // ─── 入口 ─────────────────────────────────────────────────────────
-    console.log(`[GIF下载器 v1.4] 已加载 | ${location.href} | isListPage: ${isListPage}`);
+    console.log(`[GIF下载器 v1.5] 已加载 | ${location.href} | isListPage: ${isListPage}`);
     if (isListPage) initListPage();
 
 })();
