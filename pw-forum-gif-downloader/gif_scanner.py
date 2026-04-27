@@ -34,6 +34,7 @@ def scan_gif_files(folder: Path, recursive: bool = False) -> list:
     """
     扫描文件夹，返回所有 GIF 文件名列表（仅文件名，不含路径）。
     大小写不敏感：.gif / .GIF 均可识别。
+    跳过 macOS 自动生成的 ._ 元数据附属文件。
     """
     filenames = []
 
@@ -46,9 +47,16 @@ def scan_gif_files(folder: Path, recursive: bool = False) -> list:
         if sys.platform != "win32":
             gif_files += [f for f in folder.glob("*.GIF")]
 
+    skipped = 0
     for f in gif_files:
         if f.is_file():
-            filenames.append(f.name)
+            if f.name.startswith("._"):
+                skipped += 1
+            else:
+                filenames.append(f.name)
+
+    if skipped:
+        print(f"[提示] 跳过了 {skipped} 个 macOS 元数据文件（._*）")
 
     # 去重 + 排序（方便人工核对）
     filenames = sorted(set(filenames), key=lambda x: x.lower())
