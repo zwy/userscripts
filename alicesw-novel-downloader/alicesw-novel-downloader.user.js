@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         alicesw小说章节下载器
 // @namespace    https://www.alicesw.com/
-// @version      1.6
-// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.6: 彻底移除 JSZip 依赖，改用纯原生 ZIP 构建，解决 Tampermonkey 沙箱中 generateAsync 挂起问题
+// @version      1.7
+// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.7: 修复EPUB正文为空问题，增强parseChapterParagraphs多选择器+fallback容错，与TXT使用完全相同的数据获取逻辑
 // @author       zwy
 // @match        https://www.alicesw.com/other/chapters/id/*.html
 // @match        https://alicesw.com/other/chapters/id/*.html
@@ -74,16 +74,83 @@
             url: a.href.startsWith('http') ? a.href : BASE + a.getAttribute('href')
         }));
     }
+
+    // ════════════════════════════════════════════════════
+    // parseChapterParagraphs: 多选择器 + 多策略 fallback
+    // 与 TXT 导出使用完全相同的解析逻辑，确保 EPUB/TXT 行为一致
+    // ════════════════════════════════════════════════════
     function parseChapterParagraphs(html) {
         const doc = new DOMParser().parseFromString(html, 'text/html');
-        const el = doc.querySelector('.j_readContent, .read-content');
+
+        // 按优先级依次尝试选择器
+        const SELECTORS = [
+            '.j_readContent',
+            '.read-content',
+            '.readContent',
+            '#chapterContent',
+            '.chapter-content',
+            '[class*="readContent"]',
+            '[class*="read-content"]',
+            '[class*="chapter-content"]',
+            '.content'
+        ];
+
+        let el = null;
+        for (const sel of SELECTORS) {
+            const found = doc.querySelector(sel);
+            if (found) { el = found; break; }
+        }
         if (!el) return null;
-        el.querySelectorAll('script,style,ins,iframe').forEach(e => e.remove());
-        const NOISE = new Set(['加载中...', '使用手机扫码阅读', '']);
+
+        // 清除干扰节点
+        el.querySelectorAll('script,style,ins,iframe,img,noscript,button,a').forEach(e => e.remove());
+
+        // 噪声关键词集合（扩展，兼容动态加载占位文字）
+        const NOISE = new Set([
+            '加载中...', '章节加载中...', '使用手机扫码阅读',
+            '正在加载', '内容加载中', 'Loading...', '请稍候',
+            '请稍等', '加载中', ''
+        ]);
+
         const ps = [];
-        el.querySelectorAll('p').forEach(p => { const t = p.textContent.trim(); if (!NOISE.has(t)) ps.push(t); });
+
+        // 策略1：优先从 <p> 标签提取（主流结构）
+        el.querySelectorAll('p').forEach(p => {
+            const t = p.textContent.trim();
+            if (t && t.length > 1 && !NOISE.has(t)) ps.push(t);
+        });
+
+        // 策略2：若 <p> 无内容，从 <div> 行级元素提取
+        if (!ps.length) {
+            el.querySelectorAll('div').forEach(div => {
+                // 只取直接文本内容（避免重复嵌套）
+                const directText = Array.from(div.childNodes)
+                    .filter(n => n.nodeType === Node.TEXT_NODE)
+                    .map(n => n.textContent.trim())
+                    .join('');
+                if (directText && directText.length > 5 && !NOISE.has(directText)) {
+                    ps.push(directText);
+                }
+            });
+        }
+
+        // 策略3：终极 fallback，遍历文本节点
+        if (!ps.length) {
+            const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+            let node;
+            const seen = new Set();
+            while ((node = walker.nextNode())) {
+                const t = node.textContent.trim();
+                if (t && t.length > 5 && !NOISE.has(t) && !seen.has(t)) {
+                    seen.add(t);
+                    ps.push(t);
+                }
+            }
+        }
+
         return ps.length ? ps : null;
     }
+
     function fetchChapterParagraphs(url, retry = 0) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -410,7 +477,7 @@ ${paragraphsHtml}
         });
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.6</span></strong>
+  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.7</span></strong>
   <span id="dlClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 <div id="dlBookInfo" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
@@ -606,7 +673,7 @@ ${paragraphsHtml}
                     log(`📚 整本EPUB已生成：${safeFileName(bookTitle)}_完整版.epub`, '#0369a1');
                     log(`💡 可直接导入 Kindle、Apple Books、Moon+ Reader 等阅读器`, '#9ca3af');
                 } catch(e) {
-                    log(`❌ EPUB生成失败：${e.message}`, '#ef4444');
+                    log(`❌ EPUB生成失败：${e.message}`, '#ef4444`);
                     console.error('[alicesw-epub]', e);
                 }
             }
@@ -715,9 +782,9 @@ ${ !online ? `<div style="background:#fef3c7;border:1px solid #fde68a;border-rad
                 if (!contentEl) return '';
                 const clone = contentEl.cloneNode(true);
                 clone.querySelectorAll('script,style,ins,iframe').forEach(e => e.remove());
-                const NOISE = new Set(['加载中...', '使用手机扫码阅读']);
+                const NOISE = new Set(['加载中...', '章节加载中...', '使用手机扫码阅读']);
                 return Array.from(clone.querySelectorAll('p'))
-                    .map(p => p.textContent.trim()).filter(t => t && !NOISE.has(t))
+                    .map(p => p.textContent.trim()).filter(t => t && t.length > 1 && !NOISE.has(t))
                     .join('\n\n');
             }
 
