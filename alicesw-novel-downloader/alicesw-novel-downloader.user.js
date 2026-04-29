@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         alicesw小说章节下载器
 // @namespace    https://www.alicesw.com/
-// @version      1.2
-// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）
+// @version      1.3
+// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）
 // @author       zwy
 // @match        https://www.alicesw.com/other/chapters/id/*.html
 // @match        https://alicesw.com/other/chapters/id/*.html
@@ -21,7 +21,9 @@
 // @connect      alicesw.org
 // @connect      localhost
 // @connect      127.0.0.1
+// @connect      cdnjs.cloudflare.com
 // @run-at       document-end
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @updateURL    https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js
 // ==/UserScript==
@@ -104,6 +106,171 @@
     }
 
     // ════════════════════════════════════════════════════
+    // EPUB 生成工具
+    // ════════════════════════════════════════════════════
+    function escapeXml(str) {
+        return str
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&apos;');
+    }
+
+    async function buildEpub(bookTitle, author, chapters) {
+        // chapters: Array<{ name: string, paragraphs: string[] }>
+        const zip = new JSZip();
+        const uid = 'urn:uuid:' + 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+            const r = Math.random() * 16 | 0;
+            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        });
+        const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+
+        // mimetype（必须第一个，不压缩）
+        zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+
+        // META-INF/container.xml
+        zip.folder('META-INF').file('container.xml',
+`<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`);
+
+        const oebps = zip.folder('OEBPS');
+
+        // 封面/扉页 XHTML
+        const titlePageHtml =
+`<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+  <title>${escapeXml(bookTitle)}</title>
+  <link rel="stylesheet" type="text/css" href="styles.css"/>
+</head>
+<body>
+  <div class="title-page">
+    <h1>${escapeXml(bookTitle)}</h1>
+    <p class="author">${escapeXml(author)}</p>
+    <p class="source">来源：alicesw.com</p>
+  </div>
+</body>
+</html>`;
+        oebps.file('title_page.xhtml', titlePageHtml);
+
+        // CSS
+        const css =
+`body { font-family: "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.8; margin: 1em 1.5em; }
+h1 { font-size: 1.5em; text-align: center; margin: 2em 0 0.5em; }
+h2 { font-size: 1.2em; margin: 2em 0 1em; border-bottom: 1px solid #ccc; padding-bottom: 0.3em; }
+p { text-indent: 2em; margin: 0.4em 0; }
+.title-page { text-align: center; margin-top: 4em; }
+.title-page h1 { font-size: 2em; margin-bottom: 0.5em; }
+.title-page .author { font-size: 1.1em; color: #555; }
+.title-page .source { font-size: 0.9em; color: #999; margin-top: 1em; }`;
+        oebps.file('styles.css', css);
+
+        // 每章单独 XHTML
+        const chapterIds = [];
+        chapters.forEach((ch, i) => {
+            const id = `chapter_${String(i + 1).padStart(4, '0')}`;
+            chapterIds.push(id);
+            const paragraphsHtml = ch.paragraphs
+                .map(p => `  <p>${escapeXml(p)}</p>`)
+                .join('\n');
+            const chHtml =
+`<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+  <title>${escapeXml(ch.name)}</title>
+  <link rel="stylesheet" type="text/css" href="styles.css"/>
+</head>
+<body>
+  <h2>${escapeXml(ch.name)}</h2>
+${paragraphsHtml}
+</body>
+</html>`;
+            oebps.file(`${id}.xhtml`, chHtml);
+        });
+
+        // content.opf（OPF 包文档）
+        const manifestItems = [
+            `<item id="title_page" href="title_page.xhtml" media-type="application/xhtml+xml"/>`,
+            `<item id="css" href="styles.css" media-type="text/css"/>`,
+            ...chapterIds.map(id => `<item id="${id}" href="${id}.xhtml" media-type="application/xhtml+xml"/>`)
+        ].join('\n    ');
+
+        const spineItems = [
+            `<itemref idref="title_page"/>`,
+            ...chapterIds.map(id => `<itemref idref="${id}"/>`)
+        ].join('\n    ');
+
+        const opf =
+`<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="BookId">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>${escapeXml(bookTitle)}</dc:title>
+    <dc:creator opf:role="aut">${escapeXml(author)}</dc:creator>
+    <dc:language>zh-CN</dc:language>
+    <dc:identifier id="BookId">${uid}</dc:identifier>
+    <dc:date>${now}</dc:date>
+    <dc:source>alicesw.com</dc:source>
+  </metadata>
+  <manifest>
+    ${manifestItems}
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    ${spineItems}
+  </spine>
+</package>`;
+        oebps.file('content.opf', opf);
+
+        // toc.ncx（目录导航）
+        const navPoints = [
+            `<navPoint id="np_title" playOrder="1">
+      <navLabel><text>${escapeXml(bookTitle)}</text></navLabel>
+      <content src="title_page.xhtml"/>
+    </navPoint>`,
+            ...chapters.map((ch, i) =>
+                `<navPoint id="np_${i + 2}" playOrder="${i + 2}">
+      <navLabel><text>${escapeXml(ch.name)}</text></navLabel>
+      <content src="${chapterIds[i]}.xhtml"/>
+    </navPoint>`)
+        ].join('\n    ');
+
+        const ncx =
+`<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="${uid}"/>
+    <meta name="dtb:depth" content="1"/>
+    <meta name="dtb:totalPageCount" content="0"/>
+    <meta name="dtb:maxPageNumber" content="0"/>
+  </head>
+  <docTitle><text>${escapeXml(bookTitle)}</text></docTitle>
+  <navMap>
+    ${navPoints}
+  </navMap>
+</ncx>`;
+        oebps.file('toc.ncx', ncx);
+
+        // 生成 Blob
+        const blob = await zip.generateAsync({
+            type: 'blob',
+            mimeType: 'application/epub+zip',
+            compression: 'DEFLATE',
+            compressionOptions: { level: 9 }
+        });
+        return blob;
+    }
+
+    // ════════════════════════════════════════════════════
     // TTS 工具
     // ════════════════════════════════════════════════════
     function checkTtsServer() {
@@ -147,7 +314,7 @@
     }
 
     // ════════════════════════════════════════════════════
-    // ① 章节目录页逻辑（批量下载 TXT / 合并整本）
+    // ① 章节目录页逻辑（批量下载 TXT / 合并整本 TXT / 合并整本 EPUB）
     // ════════════════════════════════════════════════════
     function initChapterListUI() {
         const fab = document.createElement('button');
@@ -165,14 +332,14 @@
         const panel = document.createElement('div');
         Object.assign(panel.style, {
             display:'none',position:'fixed',bottom:'80px',left:'24px',
-            zIndex:99998,width:'350px',background:'#fff',color:'#333',
+            zIndex:99998,width:'370px',background:'#fff',color:'#333',
             borderRadius:'12px',boxShadow:'0 8px 32px rgba(0,0,0,0.25)',
             padding:'20px',fontFamily:'system-ui,sans-serif',fontSize:'14px',
             maxHeight:'85vh',overflowY:'auto'
         });
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.2</span></strong>
+  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.3</span></strong>
   <span id="dlClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 <div id="dlBookInfo" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
@@ -192,9 +359,10 @@
 </div>
 <div style="border-top:1px solid #e5e7eb;margin-bottom:14px"></div>
 <p style="margin:0 0 8px;font-weight:bold;color:#555">选择下载模式：</p>
-<div style="display:flex;gap:8px;margin-bottom:8px">
-  <button id="dlStart" style="flex:1;padding:10px 6px;background:#059669;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px">▶ 分章下载<br><span style="font-weight:normal;font-size:10px">每章一个TXT</span></button>
-  <button id="dlMerge" style="flex:1;padding:10px 6px;background:#7c3aed;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px">📖 合并整本TXT<br><span style="font-weight:normal;font-size:10px">适配番茄小说导入</span></button>
+<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+  <button id="dlStart" style="flex:1;min-width:80px;padding:10px 6px;background:#059669;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px">▶ 分章下载<br><span style="font-weight:normal;font-size:10px">每章一个TXT</span></button>
+  <button id="dlMerge" style="flex:1;min-width:80px;padding:10px 6px;background:#7c3aed;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px">📖 合并TXT<br><span style="font-weight:normal;font-size:10px">适配番茄小说导入</span></button>
+  <button id="dlEpub" style="flex:1;min-width:80px;padding:10px 6px;background:#0369a1;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px">📚 合并EPUB<br><span style="font-weight:normal;font-size:10px">带目录的电子书</span></button>
   <button id="dlStop" style="flex:0 0 64px;padding:10px 4px;background:#ef4444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px;display:none">⏹<br>停止</button>
 </div>
 <div id="dlProgressWrap" style="display:none">
@@ -251,12 +419,16 @@
             const to   = parseInt(document.getElementById('dlTo').value) || chapters.length;
             return chapters.slice(from - 1, to);
         }
+        function setButtonsVisible(visible) {
+            document.getElementById('dlStart').style.display = visible ? 'block' : 'none';
+            document.getElementById('dlMerge').style.display = visible ? 'block' : 'none';
+            document.getElementById('dlEpub').style.display  = visible ? 'block' : 'none';
+            document.getElementById('dlStop').style.display  = visible ? 'none'  : 'block';
+        }
         function enterRunning(color) {
             isRunning = true; shouldStop = false; successCount = 0; failCount = 0;
             CONFIG.delay = Math.max(500, parseInt(document.getElementById('dlDelay').value) || 1500);
-            document.getElementById('dlStart').style.display = 'none';
-            document.getElementById('dlMerge').style.display = 'none';
-            document.getElementById('dlStop').style.display  = 'block';
+            setButtonsVisible(false);
             document.getElementById('dlStop').disabled = false;
             document.getElementById('dlStop').textContent = '⏹\n停止';
             document.getElementById('dlProgressWrap').style.display = 'block';
@@ -266,9 +438,7 @@
         }
         function exitRunning() {
             isRunning = false; shouldStop = false;
-            document.getElementById('dlStart').style.display = 'block';
-            document.getElementById('dlMerge').style.display = 'block';
-            document.getElementById('dlStop').style.display  = 'none';
+            setButtonsVisible(true);
         }
 
         // 分章下载
@@ -296,13 +466,13 @@
             log(`─── 完成！✅${successCount} ❌${failCount} ───`, '#1d4ed8');
         });
 
-        // 合并整本
+        // 合并整本 TXT
         document.getElementById('dlMerge').addEventListener('click', async () => {
             if (isRunning) return;
             const targets = getTargets();
             if (!targets.length) { alert('没有找到章节'); return; }
             const delay = enterRunning('#7c3aed');
-            log(`【合并整本】《${bookTitle}》共 ${targets.length} 章`, '#7c3aed');
+            log(`【合并整本TXT】《${bookTitle}》共 ${targets.length} 章`, '#7c3aed');
             const chunks = [];
             for (let i = 0; i < targets.length; i++) {
                 if (shouldStop) { log('⏹ 已停止', '#ef4444'); break; }
@@ -326,6 +496,46 @@
                 downloadTxt(cover + chunks.join('\n'), `${safeFileName(bookTitle)}_完整版.txt`);
                 log(`📖 整本TXT已生成：${safeFileName(bookTitle)}_完整版.txt`, '#7c3aed');
                 log(`💡 传到手机→番茄小说→书架→+→导入本地书籍`, '#9ca3af');
+            }
+            exitRunning();
+            log(`─── 完成！✅${successCount} ❌${failCount} ───`, '#1d4ed8');
+        });
+
+        // 合并整本 EPUB
+        document.getElementById('dlEpub').addEventListener('click', async () => {
+            if (isRunning) return;
+            const targets = getTargets();
+            if (!targets.length) { alert('没有找到章节'); return; }
+            const delay = enterRunning('#0369a1');
+            log(`【合并整本EPUB】《${bookTitle}》共 ${targets.length} 章`, '#0369a1');
+            const epubChapters = [];
+            for (let i = 0; i < targets.length; i++) {
+                if (shouldStop) { log('⏹ 已停止', '#ef4444'); break; }
+                const ch = targets[i];
+                log(`↓ [${i+1}/${targets.length}] ${ch.name}`);
+                updateProgress(i, targets.length, '#0369a1');
+                try {
+                    const ps = await fetchChapterParagraphs(ch.url);
+                    epubChapters.push({ name: ch.name, paragraphs: ps });
+                    successCount++; log(`✅ ${ch.name}`, '#059669');
+                } catch(e) {
+                    failCount++;
+                    epubChapters.push({ name: ch.name, paragraphs: ['【本章获取失败，请手动补全】'] });
+                    log(`❌ ${ch.name} — ${e.message}`, '#ef4444');
+                }
+                updateProgress(i+1, targets.length, '#0369a1');
+                if (i < targets.length-1 && !shouldStop) await sleep(delay);
+            }
+            if (epubChapters.length) {
+                log(`📦 正在打包 EPUB，请稍候...`, '#0369a1');
+                try {
+                    const blob = await buildEpub(bookTitle, 'alicesw.com', epubChapters);
+                    downloadBlob(blob, `${safeFileName(bookTitle)}_完整版.epub`);
+                    log(`📚 整本EPUB已生成：${safeFileName(bookTitle)}_完整版.epub`, '#0369a1');
+                    log(`💡 可直接导入 Kindle、Apple Books、Moon+ Reader 等阅读器`, '#9ca3af');
+                } catch(e) {
+                    log(`❌ EPUB生成失败：${e.message}`, '#ef4444');
+                }
             }
             exitRunning();
             log(`─── 完成！✅${successCount} ❌${failCount} ───`, '#1d4ed8');
