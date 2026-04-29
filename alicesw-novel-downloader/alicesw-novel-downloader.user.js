@@ -673,7 +673,7 @@ ${paragraphsHtml}
                     log(`📚 整本EPUB已生成：${safeFileName(bookTitle)}_完整版.epub`, '#0369a1');
                     log(`💡 可直接导入 Kindle、Apple Books、Moon+ Reader 等阅读器`, '#9ca3af');
                 } catch(e) {
-                    log(`❌ EPUB生成失败：${e.message}`, '#ef4444`);
+                    log(`❌ EPUB生成失败：${e.message}`, '#ef4444');
                     console.error('[alicesw-epub]', e);
                 }
             }
