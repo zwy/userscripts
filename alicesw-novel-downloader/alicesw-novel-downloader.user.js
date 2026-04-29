@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         alicesw小说章节下载器
 // @namespace    https://www.alicesw.com/
-// @version      1.4
-// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）
+// @version      1.5
+// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.5: 修复国内网络环境下 JSZip 无法加载导致 EPUB 导出失败的问题
 // @author       zwy
 // @match        https://www.alicesw.com/other/chapters/id/*.html
 // @match        https://alicesw.com/other/chapters/id/*.html
@@ -22,8 +22,8 @@
 // @connect      alicesw.org
 // @connect      localhost
 // @connect      127.0.0.1
-// @connect      cdnjs.cloudflare.com
 // @run-at       document-end
+// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @updateURL    https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js
@@ -132,7 +132,7 @@
         // Bug Fix 1: 校验 JSZip 是否可用，避免 "JSZip is not defined" 静默失败
         const JSZipCtor = getJSZip();
         if (!JSZipCtor) {
-            throw new Error('JSZip 库未加载，请在 Tampermonkey 脚本设置中确认 @require 已启用，或尝试重新安装脚本。');
+            throw new Error('JSZip 库未加载，请尝试：1) 在 Tampermonkey 仪表盘重新安装脚本；2) 检查网络是否可访问 cdn.jsdelivr.net；3) 关闭浏览器后重试。');
         }
 
         // Bug Fix 2: mimetype 必须是 ZIP 中的第一个文件且不压缩
@@ -279,14 +279,14 @@ ${paragraphsHtml}
 </ncx>`;
         oebps.file('toc.ncx', ncx);
 
-        // Bug Fix 2: streamFiles 确保 mimetype 排在第一位输出
+        // 说明：mimetype 文件通过 zip.file('mimetype', ..., { compression: 'STORE' }) 设置了文件级别
+        // 的 STORE 压缩，JSZip 文件级别 compression 优先于 generateAsync 全局 compression，
+        // 且由于 mimetype 第一个被加入 zip，在 ZIP 字节流中也排在第一位，符合 EPUB 规范。
         const blob = await zip.generateAsync({
             type: 'blob',
             mimeType: 'application/epub+zip',
             compression: 'DEFLATE',
-            compressionOptions: { level: 9 },
-            // 保证 mimetype 在流中第一个写出（JSZip 3.x 支持 streamFiles）
-            streamFiles: false
+            compressionOptions: { level: 9 }
         });
         return blob;
     }
@@ -360,7 +360,7 @@ ${paragraphsHtml}
         });
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.4</span></strong>
+  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.5</span></strong>
   <span id="dlClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 <div id="dlBookInfo" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
@@ -530,7 +530,7 @@ ${paragraphsHtml}
 
             // 提前检查 JSZip 是否可用，避免抓完所有章节后才报错
             if (!getJSZip()) {
-                alert('❌ JSZip 库未加载！\n\n请尝试：\n1. 在 Tampermonkey 仪表盘重新安装此脚本\n2. 确认 @require CDN 可访问（cdnjs.cloudflare.com）\n3. 关闭浏览器后重试');
+                alert('❌ JSZip 库未加载！\n\n请尝试：\n1. 在 Tampermonkey 仪表盘重新安装此脚本\n2. 确认网络可访问 cdn.jsdelivr.net\n3. 关闭浏览器后重试');
                 return;
             }
 
