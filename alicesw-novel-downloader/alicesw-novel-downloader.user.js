@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         alicesw小说章节下载器
 // @namespace    https://www.alicesw.com/
-// @version      1.7
-// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.7: 修复EPUB正文为空问题，增强parseChapterParagraphs多选择器+fallback容错，与TXT使用完全相同的数据获取逻辑
+// @version      1.8
+// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.8: 彻底修复正文为空问题——改用 iframe 等待 JS 渲染完成后读取 DOM，与 TTS 的 getFullText() 逻辑一致
 // @author       zwy
 // @match        https://www.alicesw.com/other/chapters/id/*.html
 // @match        https://alicesw.com/other/chapters/id/*.html
@@ -76,54 +76,34 @@
     }
 
     // ════════════════════════════════════════════════════
-    // parseChapterParagraphs: 多选择器 + 多策略 fallback
-    // 与 TXT 导出使用完全相同的解析逻辑，确保 EPUB/TXT 行为一致
+    // 噪声词集合（动态加载时的占位文字）
     // ════════════════════════════════════════════════════
-    function parseChapterParagraphs(html) {
-        const doc = new DOMParser().parseFromString(html, 'text/html');
+    const NOISE = new Set([
+        '加载中...', '章节加载中...', '使用手机扫码阅读',
+        '正在加载', '内容加载中', 'Loading...', '请稍候',
+        '请稍等', '加载中', ''
+    ]);
 
-        // 按优先级依次尝试选择器
-        const SELECTORS = [
-            '.j_readContent',
-            '.read-content',
-            '.readContent',
-            '#chapterContent',
-            '.chapter-content',
-            '[class*="readContent"]',
-            '[class*="read-content"]',
-            '[class*="chapter-content"]',
-            '.content'
-        ];
-
-        let el = null;
-        for (const sel of SELECTORS) {
-            const found = doc.querySelector(sel);
-            if (found) { el = found; break; }
-        }
+    // ════════════════════════════════════════════════════
+    // extractParagraphsFromEl: 从已渲染的 DOM 元素中提取正文段落
+    // 与 TTS 的 getFullText() 使用完全相同的逻辑
+    // ════════════════════════════════════════════════════
+    function extractParagraphsFromEl(el) {
         if (!el) return null;
-
-        // 清除干扰节点
-        el.querySelectorAll('script,style,ins,iframe,img,noscript,button,a').forEach(e => e.remove());
-
-        // 噪声关键词集合（扩展，兼容动态加载占位文字）
-        const NOISE = new Set([
-            '加载中...', '章节加载中...', '使用手机扫码阅读',
-            '正在加载', '内容加载中', 'Loading...', '请稍候',
-            '请稍等', '加载中', ''
-        ]);
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('script,style,ins,iframe,img,noscript,button').forEach(e => e.remove());
 
         const ps = [];
 
-        // 策略1：优先从 <p> 标签提取（主流结构）
-        el.querySelectorAll('p').forEach(p => {
+        // 策略1：优先 <p> 标签
+        clone.querySelectorAll('p').forEach(p => {
             const t = p.textContent.trim();
             if (t && t.length > 1 && !NOISE.has(t)) ps.push(t);
         });
 
-        // 策略2：若 <p> 无内容，从 <div> 行级元素提取
+        // 策略2：<p> 无内容时，从 <div> 直接文本节点提取
         if (!ps.length) {
-            el.querySelectorAll('div').forEach(div => {
-                // 只取直接文本内容（避免重复嵌套）
+            clone.querySelectorAll('div').forEach(div => {
                 const directText = Array.from(div.childNodes)
                     .filter(n => n.nodeType === Node.TEXT_NODE)
                     .map(n => n.textContent.trim())
@@ -134,9 +114,9 @@
             });
         }
 
-        // 策略3：终极 fallback，遍历文本节点
+        // 策略3：终极 fallback，遍历所有文本节点
         if (!ps.length) {
-            const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+            const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
             let node;
             const seen = new Set();
             while ((node = walker.nextNode())) {
@@ -151,23 +131,119 @@
         return ps.length ? ps : null;
     }
 
+    // ════════════════════════════════════════════════════
+    // fetchChapterParagraphs: 用 iframe 加载章节页面，
+    // 等待 JS 渲染完成后读取 DOM，彻底解决正文为空问题
+    // ════════════════════════════════════════════════════
+    const CONTENT_SELECTORS = [
+        '.j_readContent',
+        '.read-content',
+        '.readContent',
+        '#chapterContent',
+        '.chapter-content',
+        '[class*="readContent"]',
+        '[class*="read-content"]',
+        '[class*="chapter-content"]',
+        '.content'
+    ];
+
     function fetchChapterParagraphs(url, retry = 0) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: 'GET', url,
-                headers: { 'User-Agent': navigator.userAgent, 'Referer': location.origin },
-                onload(resp) {
-                    if (resp.status !== 200) return doRetry(new Error(`HTTP ${resp.status}`));
-                    const ps = parseChapterParagraphs(resp.responseText);
-                    if (!ps) return doRetry(new Error('正文提取失败'));
-                    resolve(ps);
-                },
-                onerror() { doRetry(new Error('网络请求失败')); }
-            });
-            function doRetry(err) {
-                if (retry < CONFIG.retryMax) setTimeout(() => fetchChapterParagraphs(url, retry + 1).then(resolve).catch(reject), CONFIG.retryDelay);
-                else reject(err);
+            // 创建不可见 iframe
+            const iframe = document.createElement('iframe');
+            iframe.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1024px;height:768px;opacity:0;pointer-events:none;z-index:-1;';
+            iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+            document.body.appendChild(iframe);
+
+            let settled = false;
+            function cleanup() {
+                if (iframe.parentNode) document.body.removeChild(iframe);
             }
+            function fail(err) {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                if (retry < CONFIG.retryMax) {
+                    setTimeout(() => fetchChapterParagraphs(url, retry + 1).then(resolve).catch(reject), CONFIG.retryDelay);
+                } else {
+                    reject(err);
+                }
+            }
+            function succeed(ps) {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(ps);
+            }
+
+            // 超时保护：15 秒
+            const hardTimeout = setTimeout(() => fail(new Error('加载超时')), 15000);
+
+            iframe.onload = () => {
+                // 轮询等待正文 JS 渲染完成（最多等 8 秒，每 200ms 检查一次）
+                let checkCount = 0;
+                const MAX_CHECKS = 40; // 8000ms / 200ms
+
+                const poll = setInterval(() => {
+                    checkCount++;
+                    try {
+                        const doc = iframe.contentDocument || iframe.contentWindow.document;
+                        if (!doc || doc.readyState === 'loading') return;
+
+                        // 找正文容器
+                        let el = null;
+                        for (const sel of CONTENT_SELECTORS) {
+                            const found = doc.querySelector(sel);
+                            if (found) { el = found; break; }
+                        }
+                        if (!el) {
+                            if (checkCount >= MAX_CHECKS) {
+                                clearInterval(poll);
+                                clearTimeout(hardTimeout);
+                                fail(new Error('正文容器未找到'));
+                            }
+                            return;
+                        }
+
+                        // 检查内容是否已渲染（不是占位文字，且有实质内容）
+                        const rawText = el.textContent.trim();
+                        const isPlaceholder = NOISE.has(rawText) ||
+                            rawText === '章节加载中...' ||
+                            rawText.length < 30;
+
+                        if (!isPlaceholder) {
+                            clearInterval(poll);
+                            clearTimeout(hardTimeout);
+                            const ps = extractParagraphsFromEl(el);
+                            if (ps && ps.length > 0) {
+                                succeed(ps);
+                            } else {
+                                fail(new Error('正文提取失败'));
+                            }
+                            return;
+                        }
+
+                        // 还在加载，继续等待
+                        if (checkCount >= MAX_CHECKS) {
+                            clearInterval(poll);
+                            clearTimeout(hardTimeout);
+                            fail(new Error('正文加载超时'));
+                        }
+                    } catch (e) {
+                        // 跨域异常（理论上不会发生，因为是同域）
+                        clearInterval(poll);
+                        clearTimeout(hardTimeout);
+                        fail(new Error('读取 iframe 内容失败: ' + e.message));
+                    }
+                }, 200);
+            };
+
+            iframe.onerror = () => {
+                clearTimeout(hardTimeout);
+                fail(new Error('iframe 加载失败'));
+            };
+
+            iframe.src = url;
         });
     }
 
@@ -199,9 +275,7 @@
         return (crc ^ 0xFFFFFFFF) >>> 0;
     }
 
-    // 构建标准 ZIP Blob（STORE 模式，无压缩，完全同步，无 Promise 挂起风险）
-    // files: [{name: string, data: string | Uint8Array}]
-    // mimetype 必须是 files[0]（EPUB 规范要求排在 ZIP 第一位）
+    // 构建标准 ZIP Blob（STORE 模式，无压缩）
     function buildZipBlob(files) {
         const enc = new TextEncoder();
         const parts = [], cdEntries = [];
@@ -213,42 +287,40 @@
             const c  = crc32(d);
             const sz = d.length;
 
-            // Local file header: 30 字节固定头 + 文件名
             const lh = new Uint8Array(30 + nb.length);
             const lv = new DataView(lh.buffer);
-            lv.setUint32(0,  0x04034B50, true); // signature PK\x03\x04
-            lv.setUint16(4,  20,         true); // version needed: 2.0
-            lv.setUint16(6,  0,          true); // general purpose flags
-            lv.setUint16(8,  0,          true); // compression: STORE (0)
-            lv.setUint16(10, 0,          true); // last mod time
-            lv.setUint16(12, 0,          true); // last mod date
-            lv.setUint32(14, c,          true); // CRC-32
-            lv.setUint32(18, sz,         true); // compressed size
-            lv.setUint32(22, sz,         true); // uncompressed size
-            lv.setUint16(26, nb.length,  true); // filename length
-            lv.setUint16(28, 0,          true); // extra field length
+            lv.setUint32(0,  0x04034B50, true);
+            lv.setUint16(4,  20,         true);
+            lv.setUint16(6,  0,          true);
+            lv.setUint16(8,  0,          true);
+            lv.setUint16(10, 0,          true);
+            lv.setUint16(12, 0,          true);
+            lv.setUint32(14, c,          true);
+            lv.setUint32(18, sz,         true);
+            lv.setUint32(22, sz,         true);
+            lv.setUint16(26, nb.length,  true);
+            lv.setUint16(28, 0,          true);
             lh.set(nb, 30);
 
-            // Central directory entry: 46 字节固定头 + 文件名
             const cd = new Uint8Array(46 + nb.length);
             const cv = new DataView(cd.buffer);
-            cv.setUint32(0,  0x02014B50, true); // signature PK\x01\x02
-            cv.setUint16(4,  20,         true); // version made by
-            cv.setUint16(6,  20,         true); // version needed
-            cv.setUint16(8,  0,          true); // flags
-            cv.setUint16(10, 0,          true); // compression: STORE
-            cv.setUint16(12, 0,          true); // last mod time
-            cv.setUint16(14, 0,          true); // last mod date
-            cv.setUint32(16, c,          true); // CRC-32
-            cv.setUint32(20, sz,         true); // compressed size
-            cv.setUint32(24, sz,         true); // uncompressed size
-            cv.setUint16(28, nb.length,  true); // filename length
-            cv.setUint16(30, 0,          true); // extra field length
-            cv.setUint16(32, 0,          true); // file comment length
-            cv.setUint16(34, 0,          true); // disk number start
-            cv.setUint16(36, 0,          true); // internal attributes
-            cv.setUint32(38, 0,          true); // external attributes
-            cv.setUint32(42, offset,     true); // offset of local header
+            cv.setUint32(0,  0x02014B50, true);
+            cv.setUint16(4,  20,         true);
+            cv.setUint16(6,  20,         true);
+            cv.setUint16(8,  0,          true);
+            cv.setUint16(10, 0,          true);
+            cv.setUint16(12, 0,          true);
+            cv.setUint16(14, 0,          true);
+            cv.setUint32(16, c,          true);
+            cv.setUint32(20, sz,         true);
+            cv.setUint32(24, sz,         true);
+            cv.setUint16(28, nb.length,  true);
+            cv.setUint16(30, 0,          true);
+            cv.setUint16(32, 0,          true);
+            cv.setUint16(34, 0,          true);
+            cv.setUint16(36, 0,          true);
+            cv.setUint32(38, 0,          true);
+            cv.setUint32(42, offset,     true);
             cd.set(nb, 46);
 
             parts.push(lh, d);
@@ -256,18 +328,17 @@
             offset += lh.length + d.length;
         }
 
-        // End of central directory record
         const cdSz = cdEntries.reduce((s, e) => s + e.length, 0);
         const eocd = new Uint8Array(22);
         const ev   = new DataView(eocd.buffer);
-        ev.setUint32(0,  0x06054B50,    true); // signature PK\x05\x06
-        ev.setUint16(4,  0,             true); // disk number
-        ev.setUint16(6,  0,             true); // disk with start of CD
-        ev.setUint16(8,  files.length,  true); // entries on this disk
-        ev.setUint16(10, files.length,  true); // total entries
-        ev.setUint32(12, cdSz,          true); // central directory size
-        ev.setUint32(16, offset,        true); // central directory offset
-        ev.setUint16(20, 0,             true); // comment length
+        ev.setUint32(0,  0x06054B50,    true);
+        ev.setUint16(4,  0,             true);
+        ev.setUint16(6,  0,             true);
+        ev.setUint16(8,  files.length,  true);
+        ev.setUint16(10, files.length,  true);
+        ev.setUint32(12, cdSz,          true);
+        ev.setUint32(16, offset,        true);
+        ev.setUint16(20, 0,             true);
 
         return new Blob([...parts, ...cdEntries, eocd], { type: 'application/epub+zip' });
     }
@@ -281,10 +352,8 @@
 
         const files = [];
 
-        // ① mimetype 必须排第一，且内容不含换行/BOM
         files.push({ name: 'mimetype', data: 'application/epub+zip' });
 
-        // ② META-INF/container.xml
         files.push({ name: 'META-INF/container.xml', data:
 `<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
@@ -293,7 +362,6 @@
   </rootfiles>
 </container>` });
 
-        // ③ 扉页
         files.push({ name: 'OEBPS/title_page.xhtml', data:
 `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
@@ -312,7 +380,6 @@
 </body>
 </html>` });
 
-        // ④ CSS
         files.push({ name: 'OEBPS/styles.css', data:
 `body { font-family: "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.8; margin: 1em 1.5em; }
 h1 { font-size: 1.5em; text-align: center; margin: 2em 0 0.5em; }
@@ -323,7 +390,6 @@ p { text-indent: 2em; margin: 0.4em 0; }
 .title-page .author { font-size: 1.1em; color: #555; }
 .title-page .source { font-size: 0.9em; color: #999; margin-top: 1em; }` });
 
-        // ⑤ 每章 XHTML
         const chapterIds = [];
         chapters.forEach((ch, i) => {
             const id = `chapter_${String(i + 1).padStart(4, '0')}`;
@@ -347,7 +413,6 @@ ${paragraphsHtml}
 </html>` });
         });
 
-        // ⑥ content.opf
         const manifestItems = [
             `<item id="title_page" href="title_page.xhtml" media-type="application/xhtml+xml"/>`,
             `<item id="css" href="styles.css" media-type="text/css"/>`,
@@ -377,7 +442,6 @@ ${paragraphsHtml}
   </spine>
 </package>` });
 
-        // ⑦ toc.ncx
         const navPoints = [
             `<navPoint id="np_title" playOrder="1">
       <navLabel><text>${escapeXml(bookTitle)}</text></navLabel>
@@ -477,7 +541,7 @@ ${paragraphsHtml}
         });
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.7</span></strong>
+  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.8</span></strong>
   <span id="dlClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 <div id="dlBookInfo" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
@@ -493,7 +557,7 @@ ${paragraphsHtml}
 <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">
   <span style="color:#555">请求间隔：</span>
   <input id="dlDelay" type="number" min="500" max="10000" value="1500" style="width:68px;padding:4px;border:1px solid #ddd;border-radius:4px">
-  <span style="color:#888;font-size:12px">ms（建议≥1000）</span>
+  <span style="color:#888;font-size:12px">ms（建议≥1500）</span>
 </div>
 <div style="border-top:1px solid #e5e7eb;margin-bottom:14px"></div>
 <p style="margin:0 0 8px;font-weight:bold;color:#555">选择下载模式：</p>
@@ -780,12 +844,8 @@ ${ !online ? `<div style="background:#fef3c7;border:1px solid #fde68a;border-rad
             }
             function getFullText() {
                 if (!contentEl) return '';
-                const clone = contentEl.cloneNode(true);
-                clone.querySelectorAll('script,style,ins,iframe').forEach(e => e.remove());
-                const NOISE = new Set(['加载中...', '章节加载中...', '使用手机扫码阅读']);
-                return Array.from(clone.querySelectorAll('p'))
-                    .map(p => p.textContent.trim()).filter(t => t && t.length > 1 && !NOISE.has(t))
-                    .join('\n\n');
+                const ps = extractParagraphsFromEl(contentEl);
+                return ps ? ps.join('\n\n') : '';
             }
 
             document.getElementById('ttsPlay').addEventListener('click', async () => {
