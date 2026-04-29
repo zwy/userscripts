@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         alicesw小说章节下载器
 // @namespace    https://www.alicesw.com/
-// @version      1.5
-// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.5: 修复国内网络环境下 JSZip 无法加载导致 EPUB 导出失败的问题
+// @version      1.6
+// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.6: 彻底移除 JSZip 依赖，改用纯原生 ZIP 构建，解决 Tampermonkey 沙箱中 generateAsync 挂起问题
 // @author       zwy
 // @match        https://www.alicesw.com/other/chapters/id/*.html
 // @match        https://alicesw.com/other/chapters/id/*.html
@@ -23,24 +23,12 @@
 // @connect      localhost
 // @connect      127.0.0.1
 // @run-at       document-end
-// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @updateURL    https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js
 // ==/UserScript==
 
-/* global JSZip */
-
 (function () {
     'use strict';
-
-    // ── Bug Fix: Tampermonkey GM sandbox 可能不把 @require 注入到当前作用域
-    // 优先用 GM sandbox 内的 JSZip，其次 fallback 到 unsafeWindow
-    function getJSZip() {
-        if (typeof JSZip !== 'undefined') return JSZip;
-        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.JSZip) return unsafeWindow.JSZip; } catch(e) {}
-        return null;
-    }
 
     const TTS_SERVER = 'http://127.0.0.1:9898';
 
@@ -117,7 +105,7 @@
     }
 
     // ════════════════════════════════════════════════════
-    // EPUB 生成工具
+    // EPUB 生成工具（纯原生 ZIP 构建，无需任何外部库）
     // ════════════════════════════════════════════════════
     function escapeXml(str) {
         return str
@@ -128,39 +116,118 @@
             .replace(/'/g, '&apos;');
     }
 
-    async function buildEpub(bookTitle, author, chapters) {
-        // Bug Fix 1: 校验 JSZip 是否可用，避免 "JSZip is not defined" 静默失败
-        const JSZipCtor = getJSZip();
-        if (!JSZipCtor) {
-            throw new Error('JSZip 库未加载，请尝试：1) 在 Tampermonkey 仪表盘重新安装脚本；2) 检查网络是否可访问 cdn.jsdelivr.net；3) 关闭浏览器后重试。');
+    // CRC32 查表法（ZIP 规范要求）
+    const CRC32_TABLE = (() => {
+        const t = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+            let c = i;
+            for (let j = 0; j < 8; j++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+            t[i] = c;
+        }
+        return t;
+    })();
+    function crc32(buf) {
+        let crc = 0xFFFFFFFF;
+        for (let i = 0; i < buf.length; i++) crc = CRC32_TABLE[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+        return (crc ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    // 构建标准 ZIP Blob（STORE 模式，无压缩，完全同步，无 Promise 挂起风险）
+    // files: [{name: string, data: string | Uint8Array}]
+    // mimetype 必须是 files[0]（EPUB 规范要求排在 ZIP 第一位）
+    function buildZipBlob(files) {
+        const enc = new TextEncoder();
+        const parts = [], cdEntries = [];
+        let offset = 0;
+
+        for (const { name, data } of files) {
+            const nb = enc.encode(name);
+            const d  = data instanceof Uint8Array ? data : enc.encode(data);
+            const c  = crc32(d);
+            const sz = d.length;
+
+            // Local file header: 30 字节固定头 + 文件名
+            const lh = new Uint8Array(30 + nb.length);
+            const lv = new DataView(lh.buffer);
+            lv.setUint32(0,  0x04034B50, true); // signature PK\x03\x04
+            lv.setUint16(4,  20,         true); // version needed: 2.0
+            lv.setUint16(6,  0,          true); // general purpose flags
+            lv.setUint16(8,  0,          true); // compression: STORE (0)
+            lv.setUint16(10, 0,          true); // last mod time
+            lv.setUint16(12, 0,          true); // last mod date
+            lv.setUint32(14, c,          true); // CRC-32
+            lv.setUint32(18, sz,         true); // compressed size
+            lv.setUint32(22, sz,         true); // uncompressed size
+            lv.setUint16(26, nb.length,  true); // filename length
+            lv.setUint16(28, 0,          true); // extra field length
+            lh.set(nb, 30);
+
+            // Central directory entry: 46 字节固定头 + 文件名
+            const cd = new Uint8Array(46 + nb.length);
+            const cv = new DataView(cd.buffer);
+            cv.setUint32(0,  0x02014B50, true); // signature PK\x01\x02
+            cv.setUint16(4,  20,         true); // version made by
+            cv.setUint16(6,  20,         true); // version needed
+            cv.setUint16(8,  0,          true); // flags
+            cv.setUint16(10, 0,          true); // compression: STORE
+            cv.setUint16(12, 0,          true); // last mod time
+            cv.setUint16(14, 0,          true); // last mod date
+            cv.setUint32(16, c,          true); // CRC-32
+            cv.setUint32(20, sz,         true); // compressed size
+            cv.setUint32(24, sz,         true); // uncompressed size
+            cv.setUint16(28, nb.length,  true); // filename length
+            cv.setUint16(30, 0,          true); // extra field length
+            cv.setUint16(32, 0,          true); // file comment length
+            cv.setUint16(34, 0,          true); // disk number start
+            cv.setUint16(36, 0,          true); // internal attributes
+            cv.setUint32(38, 0,          true); // external attributes
+            cv.setUint32(42, offset,     true); // offset of local header
+            cd.set(nb, 46);
+
+            parts.push(lh, d);
+            cdEntries.push(cd);
+            offset += lh.length + d.length;
         }
 
-        // Bug Fix 2: mimetype 必须是 ZIP 中的第一个文件且不压缩
-        // 通过先创建一个只含 mimetype 的 zip，再 loadAsync 合并其余文件来保证顺序
-        const zip = new JSZipCtor();
+        // End of central directory record
+        const cdSz = cdEntries.reduce((s, e) => s + e.length, 0);
+        const eocd = new Uint8Array(22);
+        const ev   = new DataView(eocd.buffer);
+        ev.setUint32(0,  0x06054B50,    true); // signature PK\x05\x06
+        ev.setUint16(4,  0,             true); // disk number
+        ev.setUint16(6,  0,             true); // disk with start of CD
+        ev.setUint16(8,  files.length,  true); // entries on this disk
+        ev.setUint16(10, files.length,  true); // total entries
+        ev.setUint32(12, cdSz,          true); // central directory size
+        ev.setUint32(16, offset,        true); // central directory offset
+        ev.setUint16(20, 0,             true); // comment length
 
-        // 先写 mimetype（STORE = 不压缩，EPUB 规范强制要求）
-        zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+        return new Blob([...parts, ...cdEntries, eocd], { type: 'application/epub+zip' });
+    }
 
+    function buildEpub(bookTitle, author, chapters) {
         const uid = 'urn:uuid:' + 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
             const r = Math.random() * 16 | 0;
             return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
         });
         const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 
-        // META-INF/container.xml
-        zip.folder('META-INF').file('container.xml',
+        const files = [];
+
+        // ① mimetype 必须排第一，且内容不含换行/BOM
+        files.push({ name: 'mimetype', data: 'application/epub+zip' });
+
+        // ② META-INF/container.xml
+        files.push({ name: 'META-INF/container.xml', data:
 `<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles>
     <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
   </rootfiles>
-</container>`);
+</container>` });
 
-        const oebps = zip.folder('OEBPS');
-
-        // 封面/扉页 XHTML
-        const titlePageHtml =
+        // ③ 扉页
+        files.push({ name: 'OEBPS/title_page.xhtml', data:
 `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
@@ -176,11 +243,10 @@
     <p class="source">来源：alicesw.com</p>
   </div>
 </body>
-</html>`;
-        oebps.file('title_page.xhtml', titlePageHtml);
+</html>` });
 
-        // CSS
-        const css =
+        // ④ CSS
+        files.push({ name: 'OEBPS/styles.css', data:
 `body { font-family: "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.8; margin: 1em 1.5em; }
 h1 { font-size: 1.5em; text-align: center; margin: 2em 0 0.5em; }
 h2 { font-size: 1.2em; margin: 2em 0 1em; border-bottom: 1px solid #ccc; padding-bottom: 0.3em; }
@@ -188,10 +254,9 @@ p { text-indent: 2em; margin: 0.4em 0; }
 .title-page { text-align: center; margin-top: 4em; }
 .title-page h1 { font-size: 2em; margin-bottom: 0.5em; }
 .title-page .author { font-size: 1.1em; color: #555; }
-.title-page .source { font-size: 0.9em; color: #999; margin-top: 1em; }`;
-        oebps.file('styles.css', css);
+.title-page .source { font-size: 0.9em; color: #999; margin-top: 1em; }` });
 
-        // 每章单独 XHTML
+        // ⑤ 每章 XHTML
         const chapterIds = [];
         chapters.forEach((ch, i) => {
             const id = `chapter_${String(i + 1).padStart(4, '0')}`;
@@ -199,7 +264,7 @@ p { text-indent: 2em; margin: 0.4em 0; }
             const paragraphsHtml = ch.paragraphs
                 .map(p => `  <p>${escapeXml(p)}</p>`)
                 .join('\n');
-            const chHtml =
+            files.push({ name: `OEBPS/${id}.xhtml`, data:
 `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
@@ -212,23 +277,20 @@ p { text-indent: 2em; margin: 0.4em 0; }
   <h2>${escapeXml(ch.name)}</h2>
 ${paragraphsHtml}
 </body>
-</html>`;
-            oebps.file(`${id}.xhtml`, chHtml);
+</html>` });
         });
 
-        // content.opf
+        // ⑥ content.opf
         const manifestItems = [
             `<item id="title_page" href="title_page.xhtml" media-type="application/xhtml+xml"/>`,
             `<item id="css" href="styles.css" media-type="text/css"/>`,
             ...chapterIds.map(id => `<item id="${id}" href="${id}.xhtml" media-type="application/xhtml+xml"/>`)
         ].join('\n    ');
-
         const spineItems = [
             `<itemref idref="title_page"/>`,
             ...chapterIds.map(id => `<itemref idref="${id}"/>`)
         ].join('\n    ');
-
-        const opf =
+        files.push({ name: 'OEBPS/content.opf', data:
 `<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="BookId">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
@@ -246,10 +308,9 @@ ${paragraphsHtml}
   <spine toc="ncx">
     ${spineItems}
   </spine>
-</package>`;
-        oebps.file('content.opf', opf);
+</package>` });
 
-        // toc.ncx
+        // ⑦ toc.ncx
         const navPoints = [
             `<navPoint id="np_title" playOrder="1">
       <navLabel><text>${escapeXml(bookTitle)}</text></navLabel>
@@ -261,8 +322,7 @@ ${paragraphsHtml}
       <content src="${chapterIds[i]}.xhtml"/>
     </navPoint>`)
         ].join('\n    ');
-
-        const ncx =
+        files.push({ name: 'OEBPS/toc.ncx', data:
 `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
@@ -276,19 +336,9 @@ ${paragraphsHtml}
   <navMap>
     ${navPoints}
   </navMap>
-</ncx>`;
-        oebps.file('toc.ncx', ncx);
+</ncx>` });
 
-        // 说明：mimetype 文件通过 zip.file('mimetype', ..., { compression: 'STORE' }) 设置了文件级别
-        // 的 STORE 压缩，JSZip 文件级别 compression 优先于 generateAsync 全局 compression，
-        // 且由于 mimetype 第一个被加入 zip，在 ZIP 字节流中也排在第一位，符合 EPUB 规范。
-        const blob = await zip.generateAsync({
-            type: 'blob',
-            mimeType: 'application/epub+zip',
-            compression: 'DEFLATE',
-            compressionOptions: { level: 9 }
-        });
-        return blob;
+        return buildZipBlob(files);
     }
 
     // ════════════════════════════════════════════════════
@@ -360,7 +410,7 @@ ${paragraphsHtml}
         });
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.5</span></strong>
+  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.6</span></strong>
   <span id="dlClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 <div id="dlBookInfo" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
@@ -528,12 +578,6 @@ ${paragraphsHtml}
             const targets = getTargets();
             if (!targets.length) { alert('没有找到章节'); return; }
 
-            // 提前检查 JSZip 是否可用，避免抓完所有章节后才报错
-            if (!getJSZip()) {
-                alert('❌ JSZip 库未加载！\n\n请尝试：\n1. 在 Tampermonkey 仪表盘重新安装此脚本\n2. 确认网络可访问 cdn.jsdelivr.net\n3. 关闭浏览器后重试');
-                return;
-            }
-
             const delay = enterRunning('#0369a1');
             log(`【合并整本EPUB】《${bookTitle}》共 ${targets.length} 章`, '#0369a1');
             const epubChapters = [];
@@ -557,7 +601,7 @@ ${paragraphsHtml}
             if (epubChapters.length) {
                 log(`📦 正在打包 EPUB，请稍候...`, '#0369a1');
                 try {
-                    const blob = await buildEpub(bookTitle, 'alicesw.com', epubChapters);
+                    const blob = buildEpub(bookTitle, 'alicesw.com', epubChapters);
                     downloadBlob(blob, `${safeFileName(bookTitle)}_完整版.epub`);
                     log(`📚 整本EPUB已生成：${safeFileName(bookTitle)}_完整版.epub`, '#0369a1');
                     log(`💡 可直接导入 Kindle、Apple Books、Moon+ Reader 等阅读器`, '#9ca3af');
