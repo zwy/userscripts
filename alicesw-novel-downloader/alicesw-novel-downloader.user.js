@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         alicesw小说章节下载器
 // @namespace    https://www.alicesw.com/
-// @version      1.3
+// @version      1.4
 // @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）
 // @author       zwy
 // @match        https://www.alicesw.com/other/chapters/id/*.html
@@ -15,6 +15,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        unsafeWindow
 // @connect      www.alicesw.com
 // @connect      alicesw.com
 // @connect      www.alicesw.org
@@ -28,8 +29,18 @@
 // @downloadURL  https://raw.githubusercontent.com/zwy/userscripts/main/alicesw-novel-downloader/alicesw-novel-downloader.user.js
 // ==/UserScript==
 
+/* global JSZip */
+
 (function () {
     'use strict';
+
+    // ── Bug Fix: Tampermonkey GM sandbox 可能不把 @require 注入到当前作用域
+    // 优先用 GM sandbox 内的 JSZip，其次 fallback 到 unsafeWindow
+    function getJSZip() {
+        if (typeof JSZip !== 'undefined') return JSZip;
+        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow.JSZip) return unsafeWindow.JSZip; } catch(e) {}
+        return null;
+    }
 
     const TTS_SERVER = 'http://127.0.0.1:9898';
 
@@ -118,16 +129,24 @@
     }
 
     async function buildEpub(bookTitle, author, chapters) {
-        // chapters: Array<{ name: string, paragraphs: string[] }>
-        const zip = new JSZip();
+        // Bug Fix 1: 校验 JSZip 是否可用，避免 "JSZip is not defined" 静默失败
+        const JSZipCtor = getJSZip();
+        if (!JSZipCtor) {
+            throw new Error('JSZip 库未加载，请在 Tampermonkey 脚本设置中确认 @require 已启用，或尝试重新安装脚本。');
+        }
+
+        // Bug Fix 2: mimetype 必须是 ZIP 中的第一个文件且不压缩
+        // 通过先创建一个只含 mimetype 的 zip，再 loadAsync 合并其余文件来保证顺序
+        const zip = new JSZipCtor();
+
+        // 先写 mimetype（STORE = 不压缩，EPUB 规范强制要求）
+        zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+
         const uid = 'urn:uuid:' + 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
             const r = Math.random() * 16 | 0;
             return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
         });
         const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
-
-        // mimetype（必须第一个，不压缩）
-        zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
 
         // META-INF/container.xml
         zip.folder('META-INF').file('container.xml',
@@ -197,7 +216,7 @@ ${paragraphsHtml}
             oebps.file(`${id}.xhtml`, chHtml);
         });
 
-        // content.opf（OPF 包文档）
+        // content.opf
         const manifestItems = [
             `<item id="title_page" href="title_page.xhtml" media-type="application/xhtml+xml"/>`,
             `<item id="css" href="styles.css" media-type="text/css"/>`,
@@ -230,7 +249,7 @@ ${paragraphsHtml}
 </package>`;
         oebps.file('content.opf', opf);
 
-        // toc.ncx（目录导航）
+        // toc.ncx
         const navPoints = [
             `<navPoint id="np_title" playOrder="1">
       <navLabel><text>${escapeXml(bookTitle)}</text></navLabel>
@@ -260,12 +279,14 @@ ${paragraphsHtml}
 </ncx>`;
         oebps.file('toc.ncx', ncx);
 
-        // 生成 Blob
+        // Bug Fix 2: streamFiles 确保 mimetype 排在第一位输出
         const blob = await zip.generateAsync({
             type: 'blob',
             mimeType: 'application/epub+zip',
             compression: 'DEFLATE',
-            compressionOptions: { level: 9 }
+            compressionOptions: { level: 9 },
+            // 保证 mimetype 在流中第一个写出（JSZip 3.x 支持 streamFiles）
+            streamFiles: false
         });
         return blob;
     }
@@ -339,7 +360,7 @@ ${paragraphsHtml}
         });
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.3</span></strong>
+  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.4</span></strong>
   <span id="dlClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 <div id="dlBookInfo" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
@@ -506,6 +527,13 @@ ${paragraphsHtml}
             if (isRunning) return;
             const targets = getTargets();
             if (!targets.length) { alert('没有找到章节'); return; }
+
+            // 提前检查 JSZip 是否可用，避免抓完所有章节后才报错
+            if (!getJSZip()) {
+                alert('❌ JSZip 库未加载！\n\n请尝试：\n1. 在 Tampermonkey 仪表盘重新安装此脚本\n2. 确认 @require CDN 可访问（cdnjs.cloudflare.com）\n3. 关闭浏览器后重试');
+                return;
+            }
+
             const delay = enterRunning('#0369a1');
             log(`【合并整本EPUB】《${bookTitle}》共 ${targets.length} 章`, '#0369a1');
             const epubChapters = [];
@@ -535,6 +563,7 @@ ${paragraphsHtml}
                     log(`💡 可直接导入 Kindle、Apple Books、Moon+ Reader 等阅读器`, '#9ca3af');
                 } catch(e) {
                     log(`❌ EPUB生成失败：${e.message}`, '#ef4444');
+                    console.error('[alicesw-epub]', e);
                 }
             }
             exitRunning();
@@ -552,7 +581,6 @@ ${paragraphsHtml}
     // ② 章节详情页逻辑（朗读 / 导出MP3）
     // ════════════════════════════════════════════════════
     function initChapterPageUI() {
-        // 先检查TTS服务是否在线
         checkTtsServer().then(async (online) => {
             const fab = document.createElement('button');
             fab.textContent = '🔊 朗读小说';
@@ -572,7 +600,6 @@ ${paragraphsHtml}
                 padding:'18px',fontFamily:'system-ui,sans-serif',fontSize:'14px'
             });
 
-            // 获取章节标题和正文
             const chapterTitle = document.querySelector('h1.read-title, .read-top h1, h1')?.textContent.trim() || document.title;
             const contentEl    = document.querySelector('.j_readContent, .read-content');
 
@@ -625,7 +652,6 @@ ${ !online ? `<div style="background:#fef3c7;border:1px solid #fde68a;border-rad
                 if (audio) { audio.pause(); audio = null; }
             });
 
-            // 速度滑块标签
             document.getElementById('ttsRate').addEventListener('input', function() {
                 const v = parseInt(this.value);
                 const lbl = v === 0 ? '正常' : (v > 0 ? `+${v}%` : `${v}%`);
@@ -651,7 +677,6 @@ ${ !online ? `<div style="background:#fef3c7;border:1px solid #fde68a;border-rad
                     .join('\n\n');
             }
 
-            // 朗读
             document.getElementById('ttsPlay').addEventListener('click', async () => {
                 const text = getFullText();
                 if (!text) { setStatus('未找到正文内容', '#ef4444'); return; }
@@ -680,14 +705,12 @@ ${ !online ? `<div style="background:#fef3c7;border:1px solid #fde68a;border-rad
                 }
             });
 
-            // 暂停/继续
             document.getElementById('ttsPause').addEventListener('click', function() {
                 if (!audio) return;
                 if (audio.paused) { audio.play(); this.textContent = '⏸ 暂停'; setStatus('▶ 朗读中...', '#059669'); }
                 else { audio.pause(); this.textContent = '▶ 继续'; setStatus('⏸ 已暂停'); }
             });
 
-            // 停止
             document.getElementById('ttsStop2').addEventListener('click', () => {
                 if (audio) { audio.pause(); audio = null; }
                 document.getElementById('ttsPlay').style.display  = 'block';
@@ -696,7 +719,6 @@ ${ !online ? `<div style="background:#fef3c7;border:1px solid #fde68a;border-rad
                 setStatus('⏹ 已停止');
             });
 
-            // 导出MP3
             document.getElementById('ttsExport').addEventListener('click', async () => {
                 const text = getFullText();
                 if (!text) { setStatus('未找到正文内容', '#ef4444'); return; }
