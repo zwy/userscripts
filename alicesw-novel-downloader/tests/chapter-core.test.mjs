@@ -1,0 +1,16 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { loadCore } from './extract-core.mjs';
+
+test('normalizeChapterLabel: mixed naming fills stable sequence numbers', () => {
+  const core = loadCore();
+  const rows = [
+    { index: 1, name: '序章' },
+    { index: 2, name: '第2章 风起' },
+    { index: 3, name: '003' },
+  ];
+  const normalized = rows.map((r, i) => core.normalizeChapterLabel(r, i + 1));
+  assert.equal(normalized[0].seq, 1);
+  assert.equal(normalized[1].seq, 2);
+  assert.equal(normalized[2].seq, 3);
+});

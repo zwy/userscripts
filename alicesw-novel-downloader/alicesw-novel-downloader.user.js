@@ -75,6 +75,28 @@
         }));
     }
 
+    // CORE_START
+    function extractChapterSeq(name) {
+        const text = String(name || '').trim();
+        const m1 = text.match(/第\s*(\d+)\s*章/i);
+        if (m1) return parseInt(m1[1], 10);
+        const m2 = text.match(/^(\d{1,5})(?:\D|$)/);
+        if (m2) return parseInt(m2[1], 10);
+        return null;
+    }
+
+    function normalizeChapterLabel(chapter, orderIndex) {
+        const seq = extractChapterSeq(chapter && chapter.name) ?? orderIndex;
+        return {
+            ...chapter,
+            seq,
+            seqPadded: String(seq).padStart(4, '0')
+        };
+    }
+
+    globalThis.__ALICESW_CORE__ = { extractChapterSeq, normalizeChapterLabel };
+    // CORE_END
+
     // ════════════════════════════════════════════════════
     // 噪声词集合（动态加载时的占位文字）
     // ════════════════════════════════════════════════════
