@@ -95,7 +95,60 @@
         };
     }
 
-    globalThis.__ALICESW_CORE__ = { extractChapterSeq, normalizeChapterLabel };
+    function textLength(value) {
+        return String(value || '').replace(/\s+/g, '').length;
+    }
+
+    function splitChapterByThreshold(title, paragraphs, options = {}) {
+        const {
+            splitThreshold = 3000,
+            targetSize = 2000,
+            mergeThreshold = 1000
+        } = options;
+
+        const source = Array.isArray(paragraphs)
+            ? paragraphs.filter(p => String(p || '').length > 0)
+            : [];
+        const totalLength = source.reduce((sum, paragraph) => sum + textLength(paragraph), 0);
+
+        if (totalLength <= splitThreshold) {
+            return [{ title, paragraphs: source.slice() }];
+        }
+
+        const chunks = [];
+        let current = [];
+        let currentLength = 0;
+
+        const flushCurrent = () => {
+            if (!current.length) return;
+            chunks.push(current);
+            current = [];
+            currentLength = 0;
+        };
+
+        for (const paragraph of source) {
+            current.push(paragraph);
+            currentLength += textLength(paragraph);
+            if (currentLength >= targetSize) {
+                flushCurrent();
+            }
+        }
+
+        if (current.length) {
+            if (chunks.length && currentLength < mergeThreshold) {
+                chunks[chunks.length - 1].push(...current);
+            } else {
+                chunks.push(current);
+            }
+        }
+
+        return chunks.map((chunk, index) => ({
+            title: `${title}【${index + 1}】`,
+            paragraphs: chunk
+        }));
+    }
+
+    globalThis.__ALICESW_CORE__ = { extractChapterSeq, normalizeChapterLabel, splitChapterByThreshold };
     // CORE_END
 
     // ════════════════════════════════════════════════════

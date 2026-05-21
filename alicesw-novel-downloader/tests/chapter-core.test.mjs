@@ -22,3 +22,47 @@ test('normalizeChapterLabel: zero sequence falls back to order index', () => {
   assert.equal(normalized.seq, 5);
   assert.equal(normalized.seqPadded, '0005');
 });
+
+test('splitChapterByThreshold: long chapters split near the 2000 target with numbered suffixes', () => {
+  const core = loadCore();
+  const paragraphs = [
+    'A'.repeat(1000),
+    'B'.repeat(1000),
+    'C'.repeat(1000),
+    'D'.repeat(1000),
+    'E'.repeat(600),
+  ];
+
+  const parts = core.splitChapterByThreshold('第十章 风起', paragraphs, {
+    splitThreshold: 3000,
+    targetSize: 2000,
+    mergeThreshold: 1000,
+  });
+
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].title, '第十章 风起【1】');
+  assert.equal(parts[1].title, '第十章 风起【2】');
+  assert.equal(parts[0].paragraphs.join('').length, 2000);
+  assert.equal(parts[1].paragraphs.join('').length, 2600);
+});
+
+test('splitChapterByThreshold: tail shorter than 1000 merges into the previous part', () => {
+  const core = loadCore();
+  const paragraphs = [
+    'A'.repeat(1000),
+    'B'.repeat(1000),
+    'C'.repeat(1000),
+    'D'.repeat(1000),
+    'E'.repeat(700),
+  ];
+
+  const parts = core.splitChapterByThreshold('第十一章 夜雨', paragraphs, {
+    splitThreshold: 3000,
+    targetSize: 2000,
+    mergeThreshold: 1000,
+  });
+
+  assert.equal(parts.length, 2);
+  assert.equal(parts[1].paragraphs.join('').length, 2700);
+  assert.ok(parts[1].paragraphs.join('').endsWith('E'.repeat(700)));
+});
