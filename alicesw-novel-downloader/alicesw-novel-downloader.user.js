@@ -135,7 +135,9 @@
         }
 
         if (current.length) {
-            if (chunks.length && currentLength < mergeThreshold) {
+            const lastChunk = chunks[chunks.length - 1];
+            const lastChunkLength = lastChunk ? lastChunk.reduce((sum, paragraph) => sum + textLength(paragraph), 0) : 0;
+            if (chunks.length && currentLength < mergeThreshold && lastChunkLength + currentLength <= splitThreshold) {
                 chunks[chunks.length - 1].push(...current);
             } else {
                 chunks.push(current);

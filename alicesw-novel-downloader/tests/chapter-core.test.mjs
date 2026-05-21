@@ -66,3 +66,21 @@ test('splitChapterByThreshold: tail shorter than 1000 merges into the previous p
   assert.equal(parts[1].paragraphs.join('').length, 2700);
   assert.ok(parts[1].paragraphs.join('').endsWith('E'.repeat(700)));
 });
+
+test('splitChapterByThreshold: tiny tail does not merge into an oversized previous part', () => {
+  const core = loadCore();
+  const paragraphs = [
+    'A'.repeat(5000),
+    'B'.repeat(500),
+  ];
+
+  const parts = core.splitChapterByThreshold('第十二章 余波', paragraphs, {
+    splitThreshold: 3000,
+    targetSize: 2000,
+    mergeThreshold: 1000,
+  });
+
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].paragraphs.join('').length, 5000);
+  assert.equal(parts[1].paragraphs.join('').length, 500);
+});
