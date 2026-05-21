@@ -115,3 +115,43 @@ test('runDownloadPipeline: retries only failed targets and keeps final placehold
   assert.match(out.resolvedChapters[1].paragraphs.join('\n'), /network down/);
   assert.equal(out.resolvedChapters[2].failed, false);
 });
+
+test('runDownloadPipeline: emits progress callbacks in attempt order', async () => {
+  const core = loadCore();
+  const targets = [
+    { index: 1, name: '第1章', url: '/1' },
+    { index: 2, name: '第2章', url: '/2' },
+    { index: 3, name: '第3章', url: '/3' },
+  ];
+  const events = [];
+  const calls = new Map(targets.map(target => [target.url, 0]));
+
+  await core.runDownloadPipeline(targets, {
+    retryRounds: 1,
+    fetcher: async chapter => {
+      calls.set(chapter.url, calls.get(chapter.url) + 1);
+      if (chapter.url === '/2') throw new Error('network down');
+      if (chapter.url === '/3' && calls.get(chapter.url) === 1) throw new Error('transient');
+      return [`正文:${chapter.name}`];
+    },
+    onProgress: event => {
+      events.push({
+        url: event.target.url,
+        round: event.round,
+        success: event.success,
+        completedAttempts: event.completedAttempts,
+        scheduledAttempts: event.scheduledAttempts,
+      });
+    }
+  });
+
+  assert.deepEqual(events.map(e => `${e.round}:${e.url}:${e.success ? 'ok' : 'fail'}`), [
+    '1:/1:ok',
+    '1:/2:fail',
+    '1:/3:fail',
+    '2:/2:fail',
+    '2:/3:ok',
+  ]);
+  assert.deepEqual(events.map(e => e.completedAttempts), [1, 2, 3, 4, 5]);
+  assert.deepEqual(events.map(e => e.scheduledAttempts), [3, 3, 3, 5, 5]);
+});

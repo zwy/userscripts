@@ -164,6 +164,9 @@
         const fetcher = typeof options.fetcher === 'function'
             ? options.fetcher
             : async () => [];
+        const onProgress = typeof options.onProgress === 'function'
+            ? options.onProgress
+            : null;
         const buildFailure = typeof options.buildFailureParagraphs === 'function'
             ? options.buildFailureParagraphs
             : buildFailureParagraphs;
@@ -180,33 +183,61 @@
             error: null,
             success: false
         }));
+        let completedAttempts = 0;
+        let scheduledAttempts = states.length;
 
-        const runSubset = async (indices) => {
-            for (const index of indices) {
+        const emitProgress = (payload) => {
+            if (!onProgress) return;
+            try {
+                onProgress(payload);
+            } catch (error) {
+                console.error('[runDownloadPipeline:onProgress]', error);
+            }
+        };
+
+        const runSubset = async (indices, roundIndex) => {
+            for (let attemptInRound = 0; attemptInRound < indices.length; attemptInRound++) {
+                const index = indices[attemptInRound];
                 if (shouldStop()) return;
                 const state = states[index];
+                let success = false;
+                let error = null;
                 try {
                     state.paragraphs = await fetcher(state.target);
                     state.error = null;
                     state.success = true;
-                } catch (error) {
-                    state.error = error;
+                    success = true;
+                } catch (err) {
+                    state.error = err;
                     state.success = false;
+                    error = err;
                 }
+                completedAttempts += 1;
+                emitProgress({
+                    target: state.target,
+                    success,
+                    error,
+                    round: roundIndex + 1,
+                    attemptInRound: attemptInRound + 1,
+                    completedAttempts,
+                    scheduledAttempts,
+                    retryRound: roundIndex > 0
+                });
                 if (!shouldStop()) {
                     await pause(state.target);
                 }
             }
         };
 
-        await runSubset(states.map((_, index) => index));
+        await runSubset(states.map((_, index) => index), 0);
 
         for (let round = 0; round < retryRounds; round++) {
             const failedIndices = states
                 .map((state, index) => (!state.success ? index : null))
                 .filter(index => index !== null);
             if (!failedIndices.length || shouldStop()) break;
-            await runSubset(failedIndices);
+            scheduledAttempts += failedIndices.length;
+            await runSubset(failedIndices, round + 1);
         }
 
         const failedChapters = [];
@@ -865,17 +896,16 @@ ${paragraphsHtml}
                 retryRounds: 1,
                 fetcher: ch => fetchChapterParagraphs(ch.url),
                 pause: () => sleep(delay),
-                shouldStop: () => shouldStop
+                shouldStop: () => shouldStop,
+                onProgress: ({ target: ch, success, error, completedAttempts, scheduledAttempts }) => {
+                    updateProgress(completedAttempts, scheduledAttempts, '#7c3aed');
+                    log(`${success ? '✅' : '❌'} ${ch.name}${success ? '' : ` — ${error?.message || '未知错误'}`}`, success ? '#059669' : '#ef4444');
+                }
             });
 
             const mergedChapters = expandMergedChapters(pipeline.resolvedChapters);
             successCount = pipeline.resolvedChapters.length - pipeline.failedChapters.length;
             failCount = pipeline.failedChapters.length;
-
-            pipeline.resolvedChapters.forEach((ch, index) => {
-                updateProgress(index + 1, targets.length, '#7c3aed');
-                log(`${ch.failed ? '❌' : '✅'} ${ch.name}${ch.failed ? ` — ${ch.error?.message || '未知错误'}` : ''}`, ch.failed ? '#ef4444' : '#059669');
-            });
 
             if (!shouldStop && mergedChapters.length) {
                 const cover = `${bookTitle}\n\n作者：（alicesw.com）\n章节数：${mergedChapters.length} 章\n\n${'━'.repeat(50)}\n`;
@@ -900,17 +930,16 @@ ${paragraphsHtml}
                 retryRounds: 1,
                 fetcher: ch => fetchChapterParagraphs(ch.url),
                 pause: () => sleep(delay),
-                shouldStop: () => shouldStop
+                shouldStop: () => shouldStop,
+                onProgress: ({ target: ch, success, error, completedAttempts, scheduledAttempts }) => {
+                    updateProgress(completedAttempts, scheduledAttempts, '#0369a1');
+                    log(`${success ? '✅' : '❌'} ${ch.name}${success ? '' : ` — ${error?.message || '未知错误'}`}`, success ? '#059669' : '#ef4444');
+                }
             });
 
             const epubChapters = expandMergedChapters(pipeline.resolvedChapters);
             successCount = pipeline.resolvedChapters.length - pipeline.failedChapters.length;
             failCount = pipeline.failedChapters.length;
-
-            pipeline.resolvedChapters.forEach((ch, index) => {
-                updateProgress(index + 1, targets.length, '#0369a1');
-                log(`${ch.failed ? '❌' : '✅'} ${ch.name}${ch.failed ? ` — ${ch.error?.message || '未知错误'}` : ''}`, ch.failed ? '#ef4444' : '#059669');
-            });
 
             if (!shouldStop && epubChapters.length) {
                 log(`📦 正在打包 EPUB，请稍候...`, '#0369a1');
