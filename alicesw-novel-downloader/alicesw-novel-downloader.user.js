@@ -86,7 +86,8 @@
     }
 
     function normalizeChapterLabel(chapter, orderIndex) {
-        const seq = extractChapterSeq(chapter && chapter.name) ?? orderIndex;
+        const extracted = extractChapterSeq(chapter && chapter.name);
+        const seq = extracted > 0 ? extracted : orderIndex;
         return {
             ...chapter,
             seq,

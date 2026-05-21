@@ -14,3 +14,11 @@ test('normalizeChapterLabel: mixed naming fills stable sequence numbers', () => 
   assert.equal(normalized[1].seq, 2);
   assert.equal(normalized[2].seq, 3);
 });
+
+test('normalizeChapterLabel: zero sequence falls back to order index', () => {
+  const core = loadCore();
+  const normalized = core.normalizeChapterLabel({ name: '第0章 起始' }, 5);
+  assert.equal(core.extractChapterSeq('第0章 起始'), 0);
+  assert.equal(normalized.seq, 5);
+  assert.equal(normalized.seqPadded, '0005');
+});
