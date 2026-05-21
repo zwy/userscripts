@@ -376,7 +376,21 @@
             document.body.appendChild(iframe);
 
             let settled = false;
+            let poll = null;
+            let hardTimeout = null;
+
+            function clearTimers() {
+                if (poll !== null) {
+                    clearInterval(poll);
+                    poll = null;
+                }
+                if (hardTimeout !== null) {
+                    clearTimeout(hardTimeout);
+                    hardTimeout = null;
+                }
+            }
             function cleanup() {
+                clearTimers();
                 if (iframe.parentNode) document.body.removeChild(iframe);
             }
             function fail(err) {
@@ -397,14 +411,14 @@
             }
 
             // 超时保护：15 秒
-            const hardTimeout = setTimeout(() => fail(new Error('加载超时')), 15000);
+            hardTimeout = setTimeout(() => fail(new Error('加载超时')), 15000);
 
             iframe.onload = () => {
                 // 轮询等待正文 JS 渲染完成（最多等 8 秒，每 200ms 检查一次）
                 let checkCount = 0;
                 const MAX_CHECKS = 40; // 8000ms / 200ms
 
-                const poll = setInterval(() => {
+                poll = setInterval(() => {
                     checkCount++;
                     try {
                         const doc = iframe.contentDocument || iframe.contentWindow.document;
@@ -418,8 +432,6 @@
                         }
                         if (!el) {
                             if (checkCount >= MAX_CHECKS) {
-                                clearInterval(poll);
-                                clearTimeout(hardTimeout);
                                 fail(new Error('正文容器未找到'));
                             }
                             return;
@@ -432,8 +444,6 @@
                             rawText.length < 30;
 
                         if (!isPlaceholder) {
-                            clearInterval(poll);
-                            clearTimeout(hardTimeout);
                             const ps = extractParagraphsFromEl(el);
                             if (ps && ps.length > 0) {
                                 succeed(ps);
@@ -445,21 +455,16 @@
 
                         // 还在加载，继续等待
                         if (checkCount >= MAX_CHECKS) {
-                            clearInterval(poll);
-                            clearTimeout(hardTimeout);
                             fail(new Error('正文加载超时'));
                         }
                     } catch (e) {
                         // 跨域异常（理论上不会发生，因为是同域）
-                        clearInterval(poll);
-                        clearTimeout(hardTimeout);
                         fail(new Error('读取 iframe 内容失败: ' + e.message));
                     }
                 }, 200);
             };
 
             iframe.onerror = () => {
-                clearTimeout(hardTimeout);
                 fail(new Error('iframe 加载失败'));
             };
 

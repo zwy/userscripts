@@ -1,5 +1,7 @@
+import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import { loadCore } from './extract-core.mjs';
 
 test('normalizeChapterLabel: mixed naming fills stable sequence numbers', () => {
@@ -161,4 +163,75 @@ test('runDownloadPipeline: emits progress callbacks in attempt order', async () 
   ]);
   assert.deepEqual(events.map(e => e.completedAttempts), [1, 2, 3, 4, 5]);
   assert.deepEqual(events.map(e => e.scheduledAttempts), [3, 3, 3, 5, 5]);
+});
+
+test('fetchChapterParagraphs: clears poll interval when hard timeout fails', async () => {
+  const source = fs.readFileSync(new URL('../alicesw-novel-downloader.user.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function fetchChapterParagraphs(url, retry = 0) {');
+  const end = source.indexOf('    // ════════════════════════════════════════════════════\n    // EPUB 生成工具', start);
+  assert.ok(start >= 0 && end > start, 'fetchChapterParagraphs source not found');
+
+  const fnSource = source.slice(start, end);
+  const iframe = { style: {}, parentNode: null, setAttribute() {}, onload: null, onerror: null };
+  const timers = [];
+  const intervals = new Set();
+  const clearStats = { timeout: 0, interval: 0 };
+
+  const context = {
+    document: {
+      body: {
+        appendChild(node) {
+          node.parentNode = this;
+        },
+        removeChild(node) {
+          node.parentNode = null;
+        }
+      },
+      createElement(tag) {
+        assert.equal(tag, 'iframe');
+        return iframe;
+      }
+    },
+    setTimeout(fn, ms) {
+      const handle = { fn, ms };
+      timers.push(handle);
+      return handle;
+    },
+    clearTimeout() {
+      clearStats.timeout += 1;
+    },
+    setInterval(fn, ms) {
+      const handle = { fn, ms };
+      intervals.add(handle);
+      return handle;
+    },
+    clearInterval(handle) {
+      clearStats.interval += 1;
+      intervals.delete(handle);
+    },
+    CONFIG: { retryMax: 0, retryDelay: 0 },
+    CONTENT_SELECTORS: [],
+    NOISE: new Set(),
+    extractParagraphsFromEl() {
+      return null;
+    },
+    console,
+    Error,
+    globalThis: {}
+  };
+
+  vm.runInNewContext(`${fnSource}\nglobalThis.__fn = fetchChapterParagraphs;`, context, { filename: 'fetchChapterParagraphs.vm' });
+
+  const promise = context.globalThis.__fn('https://example.test/chapter');
+  assert.equal(typeof iframe.onload, 'function');
+  iframe.onload();
+  assert.equal(intervals.size, 1);
+
+  const timeout = timers.find(timer => timer.ms === 15000);
+  assert.ok(timeout, 'hard timeout was not scheduled');
+  timeout.fn();
+
+  await assert.rejects(promise, /加载超时/);
+  assert.equal(clearStats.interval, 1);
+  assert.equal(intervals.size, 0);
 });
