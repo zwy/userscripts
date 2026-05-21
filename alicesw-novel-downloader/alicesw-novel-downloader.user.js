@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         alicesw小说章节下载器
 // @namespace    https://www.alicesw.com/
-// @version      1.8
-// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.8: 彻底修复正文为空问题——改用 iframe 等待 JS 渲染完成后读取 DOM，与 TTS 的 getFullText() 逻辑一致
+// @version      1.9
+// @description  在 alicesw.com 章节目录页批量下载TXT/合并整本TXT/合并整本EPUB，在章节详情页朗读小说或导出MP3（需本地Edge TTS服务）。v1.9: 增加长章节拆分控制、失败清单与“仅失败重跑”
 // @author       zwy
 // @match        https://www.alicesw.com/other/chapters/id/*.html
 // @match        https://alicesw.com/other/chapters/id/*.html
@@ -278,13 +278,15 @@
         return `${chapter.seqPadded}_${chapter.name}`;
     }
 
-    function expandMergedChapters(chapters) {
+    function expandMergedChapters(chapters, options = {}) {
+        const splitEnabled = options.splitEnabled !== false;
+        const splitConfig = options.splitConfig || MERGED_SPLIT_CONFIG;
         return chapters.flatMap((chapter, index) => {
             const normalized = normalizeChapterLabel(chapter, index + 1);
             const title = toMergedChapterTitle(normalized);
-            const parts = normalized.failed
+            const parts = normalized.failed || !splitEnabled
                 ? [{ title, paragraphs: normalized.paragraphs }]
-                : splitChapterByThreshold(title, normalized.paragraphs, MERGED_SPLIT_CONFIG);
+                : splitChapterByThreshold(title, normalized.paragraphs, splitConfig);
             return parts.map(part => ({
                 name: part.title,
                 paragraphs: part.paragraphs
@@ -758,7 +760,7 @@ ${paragraphsHtml}
         });
         panel.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.8</span></strong>
+  <strong style="font-size:15px">📥 小说章节下载器 <span style="font-size:11px;color:#9ca3af">v1.9</span></strong>
   <span id="dlClose" style="cursor:pointer;font-size:20px">✕</span>
 </div>
 <div id="dlBookInfo" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px;margin-bottom:14px;line-height:1.8;font-size:13px"></div>
@@ -776,6 +778,26 @@ ${paragraphsHtml}
   <input id="dlDelay" type="number" min="500" max="10000" value="1500" style="width:68px;padding:4px;border:1px solid #ddd;border-radius:4px">
   <span style="color:#888;font-size:12px">ms（建议≥1500）</span>
 </div>
+<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:12px">
+  <label style="display:flex;align-items:center;gap:6px;font-weight:bold;color:#555;margin-bottom:8px">
+    <input id="dlSplitToggle" type="checkbox" checked>
+    长章节拆分
+  </label>
+  <div id="dlSplitInputs" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px">
+    <label style="font-size:12px;color:#6b7280">
+      触发阈值
+      <input id="dlSplitThreshold" type="number" min="1" value="3000" style="width:100%;margin-top:4px;padding:4px;border:1px solid #ddd;border-radius:4px">
+    </label>
+    <label style="font-size:12px;color:#6b7280">
+      目标大小
+      <input id="dlSplitTarget" type="number" min="1" value="2000" style="width:100%;margin-top:4px;padding:4px;border:1px solid #ddd;border-radius:4px">
+    </label>
+    <label style="font-size:12px;color:#6b7280">
+      尾段并入
+      <input id="dlSplitMerge" type="number" min="1" value="1000" style="width:100%;margin-top:4px;padding:4px;border:1px solid #ddd;border-radius:4px">
+    </label>
+  </div>
+</div>
 <div style="border-top:1px solid #e5e7eb;margin-bottom:14px"></div>
 <p style="margin:0 0 8px;font-weight:bold;color:#555">选择下载模式：</p>
 <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
@@ -783,6 +805,13 @@ ${paragraphsHtml}
   <button id="dlMerge" style="flex:1;min-width:80px;padding:10px 6px;background:#7c3aed;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px">📖 合并TXT<br><span style="font-weight:normal;font-size:10px">适配番茄小说导入</span></button>
   <button id="dlEpub" style="flex:1;min-width:80px;padding:10px 6px;background:#0369a1;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px">📚 合并EPUB<br><span style="font-weight:normal;font-size:10px">带目录的电子书</span></button>
   <button id="dlStop" style="flex:0 0 64px;padding:10px 4px;background:#ef4444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:12px;display:none">⏹<br>停止</button>
+</div>
+<div id="dlFailedWrap" style="display:none;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px;margin-bottom:12px">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
+    <strong style="color:#b91c1c">失败清单</strong>
+    <button id="dlRetryFailed" style="display:none;padding:6px 10px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:bold">仅失败重跑</button>
+  </div>
+  <div id="dlFailedList" style="font-size:12px;color:#7f1d1d;line-height:1.6;max-height:130px;overflow-y:auto"></div>
 </div>
 <div id="dlProgressWrap" style="display:none">
   <div style="display:flex;justify-content:space-between;margin-bottom:4px">
@@ -800,6 +829,8 @@ ${paragraphsHtml}
 
         const bookTitle = getBookTitle();
         let chapters = [], isRunning = false, shouldStop = false, successCount = 0, failCount = 0;
+        let lastFailedTargets = [];
+        let lastMergedState = null;
 
         fab.addEventListener('click', () => {
             const open = panel.style.display === 'block';
@@ -815,6 +846,10 @@ ${paragraphsHtml}
         panel.querySelectorAll('input[name="dlRange"]').forEach(r => r.addEventListener('change', () => {
             document.getElementById('dlRangeInputs').style.display = r.value === 'range' ? 'flex' : 'none';
         }));
+        document.getElementById('dlSplitToggle').addEventListener('change', (e) => {
+            document.getElementById('dlSplitInputs').style.opacity = e.target.checked ? '1' : '0.45';
+        });
+        document.getElementById('dlSplitToggle').dispatchEvent(new Event('change'));
 
         function log(msg, color = '#555') {
             const el = document.getElementById('dlLog');
@@ -830,6 +865,132 @@ ${paragraphsHtml}
             document.getElementById('dlProgressPct').textContent = pct + '%';
             document.getElementById('dlProgressText').textContent = `已完成 ${done}/${total}（✅${successCount} ❌${failCount}）`;
         }
+        function getSplitSettings() {
+            return {
+                splitEnabled: document.getElementById('dlSplitToggle').checked,
+                splitConfig: {
+                    splitThreshold: Math.max(1, parseInt(document.getElementById('dlSplitThreshold').value, 10) || 3000),
+                    targetSize: Math.max(1, parseInt(document.getElementById('dlSplitTarget').value, 10) || 2000),
+                    mergeThreshold: Math.max(1, parseInt(document.getElementById('dlSplitMerge').value, 10) || 1000)
+                }
+            };
+        }
+        function escapeHtml(value) {
+            return String(value || '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[ch]));
+        }
+        function renderFailedSummary(failedChapters) {
+            const wrap = document.getElementById('dlFailedWrap');
+            const list = document.getElementById('dlFailedList');
+            if (!failedChapters || !failedChapters.length) {
+                wrap.style.display = 'none';
+                list.innerHTML = '';
+                lastFailedTargets = [];
+                return;
+            }
+            wrap.style.display = 'block';
+            list.innerHTML = failedChapters.map((ch, i) => {
+                const reason = ch.error?.message ? ` — ${escapeHtml(ch.error.message)}` : '';
+                return `<div style="padding:2px 0">${i + 1}. ${escapeHtml(ch.name)}${reason}</div>`;
+            }).join('');
+            lastFailedTargets = failedChapters.map(ch => ({ ...ch }));
+        }
+        function chapterKey(chapter) {
+            return chapter?.url || `${chapter?.index || ''}::${chapter?.name || ''}`;
+        }
+        function mergeChapterResults(baseChapters, updatedChapters) {
+            const updateMap = new Map((updatedChapters || []).map(ch => [chapterKey(ch), ch]));
+            return (baseChapters || []).map(ch => updateMap.get(chapterKey(ch)) || ch);
+        }
+        function getMergedChaptersForExport(resolvedChapters, splitSettings) {
+            return expandMergedChapters(resolvedChapters, splitSettings);
+        }
+        function getMergedExportContext(mode) {
+            if (mode === 'epub') {
+                return {
+                    color: '#0369a1',
+                    label: '【合并整本EPUB】',
+                    exportName: `${safeFileName(bookTitle)}_完整版.epub`,
+                    exportChapters: (chaptersToExport) => {
+                        const blob = buildEpub(bookTitle, 'alicesw.com', chaptersToExport);
+                        downloadBlob(blob, `${safeFileName(bookTitle)}_完整版.epub`);
+                    }
+                };
+            }
+            return {
+                color: '#7c3aed',
+                label: '【合并整本TXT】',
+                exportName: `${safeFileName(bookTitle)}_完整版.txt`,
+                exportChapters: (chaptersToExport) => {
+                    const cover = `${bookTitle}\n\n作者：（alicesw.com）\n章节数：${chaptersToExport.length} 章\n\n${'━'.repeat(50)}\n`;
+                    const chunks = chaptersToExport.map(ch => `\n${ch.name}\n\n${ch.paragraphs.join('\n\n')}\n`);
+                    downloadTxt(cover + chunks.join('\n'), `${safeFileName(bookTitle)}_完整版.txt`);
+                }
+            };
+        }
+        async function runMergedExport(mode, targets, retryOnly = false) {
+            if (isRunning) return;
+            const targetList = Array.isArray(targets) ? targets : getTargets();
+            if (!targetList.length) { alert('没有找到章节'); return; }
+
+            const splitSettings = retryOnly && lastMergedState?.splitSettings
+                ? lastMergedState.splitSettings
+                : getSplitSettings();
+            const ctx = getMergedExportContext(mode);
+            const delay = enterRunning(ctx.color);
+            const actionLabel = retryOnly ? `${ctx.label}（仅失败重跑）` : ctx.label;
+            log(`${actionLabel}《${bookTitle}》共 ${targetList.length} 章`, ctx.color);
+
+            const pipeline = await runDownloadPipeline(targetList, {
+                retryRounds: 1,
+                fetcher: ch => fetchChapterParagraphs(ch.url),
+                pause: () => sleep(delay),
+                shouldStop: () => shouldStop,
+                onProgress: ({ target: ch, success, error, completedAttempts, scheduledAttempts }) => {
+                    updateProgress(completedAttempts, scheduledAttempts, ctx.color);
+                    log(`${success ? '✅' : '❌'} ${ch.name}${success ? '' : ` — ${error?.message || '未知错误'}`}`, success ? '#059669' : '#ef4444');
+                }
+            });
+
+            const resolvedChapters = retryOnly && lastMergedState
+                ? mergeChapterResults(lastMergedState.resolvedChapters, pipeline.resolvedChapters)
+                : pipeline.resolvedChapters;
+            const mergedChapters = getMergedChaptersForExport(resolvedChapters, splitSettings);
+            successCount = resolvedChapters.length - pipeline.failedChapters.length;
+            failCount = pipeline.failedChapters.length;
+            lastMergedState = { mode, resolvedChapters, splitSettings };
+
+            renderFailedSummary(pipeline.failedChapters);
+            if (failCount > 0) {
+                log(`⚠️ 仍有 ${failCount} 章失败，可点“仅失败重跑”继续补齐`, '#b45309');
+            }
+
+            if (!shouldStop && mergedChapters.length) {
+                if (mode === 'epub') {
+                    log(`📦 正在打包 EPUB，请稍候...`, '#0369a1');
+                    try {
+                        ctx.exportChapters(mergedChapters);
+                        log(`📚 整本EPUB已生成：${ctx.exportName}`, '#0369a1');
+                        log(`💡 可直接导入 Kindle、Apple Books、Moon+ Reader 等阅读器`, '#9ca3af');
+                    } catch (e) {
+                        log(`❌ EPUB生成失败：${e.message}`, '#ef4444');
+                        console.error('[alicesw-epub]', e);
+                    }
+                } else {
+                    ctx.exportChapters(mergedChapters);
+                    log(`📖 整本TXT已生成：${ctx.exportName}`, '#7c3aed');
+                    log(`💡 传到手机→番茄小说→书架→+→导入本地书籍`, '#9ca3af');
+                }
+            }
+
+            exitRunning();
+            log(`─── 完成！✅${successCount} ❌${failCount} ───`, '#1d4ed8');
+        }
         function getTargets() {
             if (!chapters.length) chapters = extractChapters();
             const v = panel.querySelector('input[name="dlRange"]:checked').value;
@@ -843,6 +1004,7 @@ ${paragraphsHtml}
             document.getElementById('dlMerge').style.display = visible ? 'block' : 'none';
             document.getElementById('dlEpub').style.display  = visible ? 'block' : 'none';
             document.getElementById('dlStop').style.display  = visible ? 'none'  : 'block';
+            document.getElementById('dlRetryFailed').style.display = visible && lastFailedTargets.length ? 'inline-block' : 'none';
         }
         function enterRunning(color) {
             isRunning = true; shouldStop = false; successCount = 0; failCount = 0;
@@ -885,82 +1047,22 @@ ${paragraphsHtml}
             log(`─── 完成！✅${successCount} ❌${failCount} ───`, '#1d4ed8');
         });
 
-        // 合并整本 TXT
+        // 合并整本 TXT / EPUB
         document.getElementById('dlMerge').addEventListener('click', async () => {
-            if (isRunning) return;
-            const targets = getTargets();
-            if (!targets.length) { alert('没有找到章节'); return; }
-            const delay = enterRunning('#7c3aed');
-            log(`【合并整本TXT】《${bookTitle}》共 ${targets.length} 章`, '#7c3aed');
-            const pipeline = await runDownloadPipeline(targets, {
-                retryRounds: 1,
-                fetcher: ch => fetchChapterParagraphs(ch.url),
-                pause: () => sleep(delay),
-                shouldStop: () => shouldStop,
-                onProgress: ({ target: ch, success, error, completedAttempts, scheduledAttempts }) => {
-                    updateProgress(completedAttempts, scheduledAttempts, '#7c3aed');
-                    log(`${success ? '✅' : '❌'} ${ch.name}${success ? '' : ` — ${error?.message || '未知错误'}`}`, success ? '#059669' : '#ef4444');
-                }
-            });
-
-            const mergedChapters = expandMergedChapters(pipeline.resolvedChapters);
-            successCount = pipeline.resolvedChapters.length - pipeline.failedChapters.length;
-            failCount = pipeline.failedChapters.length;
-
-            if (!shouldStop && mergedChapters.length) {
-                const cover = `${bookTitle}\n\n作者：（alicesw.com）\n章节数：${mergedChapters.length} 章\n\n${'━'.repeat(50)}\n`;
-                const chunks = mergedChapters.map(ch => `\n${ch.name}\n\n${ch.paragraphs.join('\n\n')}\n`);
-                downloadTxt(cover + chunks.join('\n'), `${safeFileName(bookTitle)}_完整版.txt`);
-                log(`📖 整本TXT已生成：${safeFileName(bookTitle)}_完整版.txt`, '#7c3aed');
-                log(`💡 传到手机→番茄小说→书架→+→导入本地书籍`, '#9ca3af');
-            }
-            exitRunning();
-            log(`─── 完成！✅${successCount} ❌${failCount} ───`, '#1d4ed8');
+            await runMergedExport('txt');
         });
-
-        // 合并整本 EPUB
         document.getElementById('dlEpub').addEventListener('click', async () => {
-            if (isRunning) return;
-            const targets = getTargets();
-            if (!targets.length) { alert('没有找到章节'); return; }
-
-            const delay = enterRunning('#0369a1');
-            log(`【合并整本EPUB】《${bookTitle}》共 ${targets.length} 章`, '#0369a1');
-            const pipeline = await runDownloadPipeline(targets, {
-                retryRounds: 1,
-                fetcher: ch => fetchChapterParagraphs(ch.url),
-                pause: () => sleep(delay),
-                shouldStop: () => shouldStop,
-                onProgress: ({ target: ch, success, error, completedAttempts, scheduledAttempts }) => {
-                    updateProgress(completedAttempts, scheduledAttempts, '#0369a1');
-                    log(`${success ? '✅' : '❌'} ${ch.name}${success ? '' : ` — ${error?.message || '未知错误'}`}`, success ? '#059669' : '#ef4444');
-                }
-            });
-
-            const epubChapters = expandMergedChapters(pipeline.resolvedChapters);
-            successCount = pipeline.resolvedChapters.length - pipeline.failedChapters.length;
-            failCount = pipeline.failedChapters.length;
-
-            if (!shouldStop && epubChapters.length) {
-                log(`📦 正在打包 EPUB，请稍候...`, '#0369a1');
-                try {
-                    const blob = buildEpub(bookTitle, 'alicesw.com', epubChapters);
-                    downloadBlob(blob, `${safeFileName(bookTitle)}_完整版.epub`);
-                    log(`📚 整本EPUB已生成：${safeFileName(bookTitle)}_完整版.epub`, '#0369a1');
-                    log(`💡 可直接导入 Kindle、Apple Books、Moon+ Reader 等阅读器`, '#9ca3af');
-                } catch(e) {
-                    log(`❌ EPUB生成失败：${e.message}`, '#ef4444');
-                    console.error('[alicesw-epub]', e);
-                }
-            }
-            exitRunning();
-            log(`─── 完成！✅${successCount} ❌${failCount} ───`, '#1d4ed8');
+            await runMergedExport('epub');
         });
 
         document.getElementById('dlStop').addEventListener('click', () => {
             shouldStop = true;
             document.getElementById('dlStop').textContent = '停止中';
             document.getElementById('dlStop').disabled = true;
+        });
+        document.getElementById('dlRetryFailed').addEventListener('click', async () => {
+            if (isRunning || !lastFailedTargets.length || !lastMergedState) return;
+            await runMergedExport(lastMergedState.mode || 'txt', lastFailedTargets, true);
         });
     }
 
