@@ -84,3 +84,34 @@ test('splitChapterByThreshold: tiny tail does not merge into an oversized previo
   assert.equal(parts[0].paragraphs.join('').length, 5000);
   assert.equal(parts[1].paragraphs.join('').length, 500);
 });
+
+test('runDownloadPipeline: retries only failed targets and keeps final placeholders', async () => {
+  const core = loadCore();
+  const targets = [
+    { index: 1, name: '第1章', url: '/1' },
+    { index: 2, name: '第2章', url: '/2' },
+    { index: 3, name: '第3章', url: '/3' },
+  ];
+  const calls = new Map(targets.map(target => [target.url, 0]));
+
+  const out = await core.runDownloadPipeline(targets, {
+    retryRounds: 1,
+    fetcher: async chapter => {
+      calls.set(chapter.url, calls.get(chapter.url) + 1);
+      if (chapter.url === '/2') throw new Error('network down');
+      if (chapter.url === '/3' && calls.get(chapter.url) === 1) throw new Error('transient');
+      return [`正文:${chapter.name}`];
+    }
+  });
+
+  assert.equal(calls.get('/1'), 1);
+  assert.equal(calls.get('/2'), 2);
+  assert.equal(calls.get('/3'), 2);
+  assert.equal(out.failedChapters.length, 1);
+  assert.equal(out.failedChapters[0].name, '第2章');
+  assert.equal(out.resolvedChapters.length, 3);
+  assert.equal(out.resolvedChapters[1].failed, true);
+  assert.match(out.resolvedChapters[1].paragraphs.join('\n'), /【本章获取失败】/);
+  assert.match(out.resolvedChapters[1].paragraphs.join('\n'), /network down/);
+  assert.equal(out.resolvedChapters[2].failed, false);
+});

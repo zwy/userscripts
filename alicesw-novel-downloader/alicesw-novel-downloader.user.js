@@ -150,8 +150,116 @@
         }));
     }
 
-    globalThis.__ALICESW_CORE__ = { extractChapterSeq, normalizeChapterLabel, splitChapterByThreshold };
+    function buildFailureParagraphs(chapter, error) {
+        const reason = error && error.message ? error.message : '未知错误';
+        return [
+            '【本章获取失败】',
+            `原因：${reason}`,
+            '建议：使用“仅失败重跑”补齐后重新导出'
+        ];
+    }
+
+    async function runDownloadPipeline(targets, options = {}) {
+        const retryRounds = Number.isInteger(options.retryRounds) ? options.retryRounds : 1;
+        const fetcher = typeof options.fetcher === 'function'
+            ? options.fetcher
+            : async () => [];
+        const buildFailure = typeof options.buildFailureParagraphs === 'function'
+            ? options.buildFailureParagraphs
+            : buildFailureParagraphs;
+        const shouldStop = typeof options.shouldStop === 'function'
+            ? options.shouldStop
+            : () => false;
+        const pause = typeof options.pause === 'function'
+            ? options.pause
+            : async () => {};
+
+        const states = Array.from(targets || [], target => ({
+            target,
+            paragraphs: null,
+            error: null,
+            success: false
+        }));
+
+        const runSubset = async (indices) => {
+            for (const index of indices) {
+                if (shouldStop()) return;
+                const state = states[index];
+                try {
+                    state.paragraphs = await fetcher(state.target);
+                    state.error = null;
+                    state.success = true;
+                } catch (error) {
+                    state.error = error;
+                    state.success = false;
+                }
+                if (!shouldStop()) {
+                    await pause(state.target);
+                }
+            }
+        };
+
+        await runSubset(states.map((_, index) => index));
+
+        for (let round = 0; round < retryRounds; round++) {
+            const failedIndices = states
+                .map((state, index) => (!state.success ? index : null))
+                .filter(index => index !== null);
+            if (!failedIndices.length || shouldStop()) break;
+            await runSubset(failedIndices);
+        }
+
+        const failedChapters = [];
+        const resolvedChapters = states.map(state => {
+            if (state.success) {
+                return { ...state.target, paragraphs: Array.isArray(state.paragraphs) ? state.paragraphs : [], failed: false };
+            }
+
+            const failedChapter = {
+                ...state.target,
+                error: state.error,
+                paragraphs: buildFailure(state.target, state.error),
+                failed: true
+            };
+            failedChapters.push(failedChapter);
+            return failedChapter;
+        });
+
+        return { resolvedChapters, failedChapters };
+    }
+
+    globalThis.__ALICESW_CORE__ = {
+        extractChapterSeq,
+        normalizeChapterLabel,
+        splitChapterByThreshold,
+        buildFailureParagraphs,
+        runDownloadPipeline
+    };
     // CORE_END
+
+    const MERGED_SPLIT_CONFIG = {
+        splitThreshold: 3000,
+        targetSize: 2000,
+        mergeThreshold: 1000
+    };
+
+    function toMergedChapterTitle(chapter) {
+        return `${chapter.seqPadded}_${chapter.name}`;
+    }
+
+    function expandMergedChapters(chapters) {
+        return chapters.flatMap((chapter, index) => {
+            const normalized = normalizeChapterLabel(chapter, index + 1);
+            const title = toMergedChapterTitle(normalized);
+            const parts = normalized.failed
+                ? [{ title, paragraphs: normalized.paragraphs }]
+                : splitChapterByThreshold(title, normalized.paragraphs, MERGED_SPLIT_CONFIG);
+            return parts.map(part => ({
+                name: part.title,
+                paragraphs: part.paragraphs
+            }));
+        });
+    }
 
     // ════════════════════════════════════════════════════
     // 噪声词集合（动态加载时的占位文字）
@@ -753,26 +861,25 @@ ${paragraphsHtml}
             if (!targets.length) { alert('没有找到章节'); return; }
             const delay = enterRunning('#7c3aed');
             log(`【合并整本TXT】《${bookTitle}》共 ${targets.length} 章`, '#7c3aed');
-            const chunks = [];
-            for (let i = 0; i < targets.length; i++) {
-                if (shouldStop) { log('⏹ 已停止', '#ef4444'); break; }
-                const ch = targets[i];
-                log(`↓ [${i+1}/${targets.length}] ${ch.name}`);
-                updateProgress(i, targets.length, '#7c3aed');
-                try {
-                    const ps = await fetchChapterParagraphs(ch.url);
-                    chunks.push(`\n${ch.name}\n\n${ps.join('\n\n')}\n`);
-                    successCount++; log(`✅ ${ch.name}`, '#059669');
-                } catch(e) {
-                    failCount++;
-                    chunks.push(`\n${ch.name}\n\n【本章获取失败，请手动补全】\n`);
-                    log(`❌ ${ch.name} — ${e.message}`, '#ef4444');
-                }
-                updateProgress(i+1, targets.length, '#7c3aed');
-                if (i < targets.length-1 && !shouldStop) await sleep(delay);
-            }
-            if (chunks.length) {
-                const cover = `${bookTitle}\n\n作者：（alicesw.com）\n章节数：${chunks.length} 章\n\n${'━'.repeat(50)}\n`;
+            const pipeline = await runDownloadPipeline(targets, {
+                retryRounds: 1,
+                fetcher: ch => fetchChapterParagraphs(ch.url),
+                pause: () => sleep(delay),
+                shouldStop: () => shouldStop
+            });
+
+            const mergedChapters = expandMergedChapters(pipeline.resolvedChapters);
+            successCount = pipeline.resolvedChapters.length - pipeline.failedChapters.length;
+            failCount = pipeline.failedChapters.length;
+
+            pipeline.resolvedChapters.forEach((ch, index) => {
+                updateProgress(index + 1, targets.length, '#7c3aed');
+                log(`${ch.failed ? '❌' : '✅'} ${ch.name}${ch.failed ? ` — ${ch.error?.message || '未知错误'}` : ''}`, ch.failed ? '#ef4444' : '#059669');
+            });
+
+            if (!shouldStop && mergedChapters.length) {
+                const cover = `${bookTitle}\n\n作者：（alicesw.com）\n章节数：${mergedChapters.length} 章\n\n${'━'.repeat(50)}\n`;
+                const chunks = mergedChapters.map(ch => `\n${ch.name}\n\n${ch.paragraphs.join('\n\n')}\n`);
                 downloadTxt(cover + chunks.join('\n'), `${safeFileName(bookTitle)}_完整版.txt`);
                 log(`📖 整本TXT已生成：${safeFileName(bookTitle)}_完整版.txt`, '#7c3aed');
                 log(`💡 传到手机→番茄小说→书架→+→导入本地书籍`, '#9ca3af');
@@ -789,25 +896,23 @@ ${paragraphsHtml}
 
             const delay = enterRunning('#0369a1');
             log(`【合并整本EPUB】《${bookTitle}》共 ${targets.length} 章`, '#0369a1');
-            const epubChapters = [];
-            for (let i = 0; i < targets.length; i++) {
-                if (shouldStop) { log('⏹ 已停止', '#ef4444'); break; }
-                const ch = targets[i];
-                log(`↓ [${i+1}/${targets.length}] ${ch.name}`);
-                updateProgress(i, targets.length, '#0369a1');
-                try {
-                    const ps = await fetchChapterParagraphs(ch.url);
-                    epubChapters.push({ name: ch.name, paragraphs: ps });
-                    successCount++; log(`✅ ${ch.name}`, '#059669');
-                } catch(e) {
-                    failCount++;
-                    epubChapters.push({ name: ch.name, paragraphs: ['【本章获取失败，请手动补全】'] });
-                    log(`❌ ${ch.name} — ${e.message}`, '#ef4444');
-                }
-                updateProgress(i+1, targets.length, '#0369a1');
-                if (i < targets.length-1 && !shouldStop) await sleep(delay);
-            }
-            if (epubChapters.length) {
+            const pipeline = await runDownloadPipeline(targets, {
+                retryRounds: 1,
+                fetcher: ch => fetchChapterParagraphs(ch.url),
+                pause: () => sleep(delay),
+                shouldStop: () => shouldStop
+            });
+
+            const epubChapters = expandMergedChapters(pipeline.resolvedChapters);
+            successCount = pipeline.resolvedChapters.length - pipeline.failedChapters.length;
+            failCount = pipeline.failedChapters.length;
+
+            pipeline.resolvedChapters.forEach((ch, index) => {
+                updateProgress(index + 1, targets.length, '#0369a1');
+                log(`${ch.failed ? '❌' : '✅'} ${ch.name}${ch.failed ? ` — ${ch.error?.message || '未知错误'}` : ''}`, ch.failed ? '#ef4444' : '#059669');
+            });
+
+            if (!shouldStop && epubChapters.length) {
                 log(`📦 正在打包 EPUB，请稍候...`, '#0369a1');
                 try {
                     const blob = buildEpub(bookTitle, 'alicesw.com', epubChapters);
