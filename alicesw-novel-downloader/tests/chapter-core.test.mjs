@@ -23,6 +23,13 @@ test('normalizeChapterLabel: zero sequence falls back to order index', () => {
   assert.equal(normalized.seqPadded, '0005');
 });
 
+test('default split config matches the 3000/2000/1000 contract', () => {
+  const core = loadCore();
+  assert.equal(core.DEFAULT_SPLIT_CONFIG.splitThreshold, 3000);
+  assert.equal(core.DEFAULT_SPLIT_CONFIG.targetSize, 2000);
+  assert.equal(core.DEFAULT_SPLIT_CONFIG.mergeThreshold, 1000);
+});
+
 test('splitChapterByThreshold: long chapters split near the 2000 target with numbered suffixes', () => {
   const core = loadCore();
   const paragraphs = [

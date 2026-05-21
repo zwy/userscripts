@@ -99,11 +99,17 @@
         return String(value || '').replace(/\s+/g, '').length;
     }
 
+    const DEFAULT_SPLIT_CONFIG = Object.freeze({
+        splitThreshold: 3000,
+        targetSize: 2000,
+        mergeThreshold: 1000
+    });
+
     function splitChapterByThreshold(title, paragraphs, options = {}) {
         const {
-            splitThreshold = 3000,
-            targetSize = 2000,
-            mergeThreshold = 1000
+            splitThreshold = DEFAULT_SPLIT_CONFIG.splitThreshold,
+            targetSize = DEFAULT_SPLIT_CONFIG.targetSize,
+            mergeThreshold = DEFAULT_SPLIT_CONFIG.mergeThreshold
         } = options;
 
         const source = Array.isArray(paragraphs)
@@ -264,15 +270,10 @@
         normalizeChapterLabel,
         splitChapterByThreshold,
         buildFailureParagraphs,
-        runDownloadPipeline
+        runDownloadPipeline,
+        DEFAULT_SPLIT_CONFIG
     };
     // CORE_END
-
-    const MERGED_SPLIT_CONFIG = {
-        splitThreshold: 3000,
-        targetSize: 2000,
-        mergeThreshold: 1000
-    };
 
     function toMergedChapterTitle(chapter) {
         return `${chapter.seqPadded}_${chapter.name}`;
@@ -280,7 +281,7 @@
 
     function expandMergedChapters(chapters, options = {}) {
         const splitEnabled = options.splitEnabled !== false;
-        const splitConfig = options.splitConfig || MERGED_SPLIT_CONFIG;
+        const splitConfig = options.splitConfig || DEFAULT_SPLIT_CONFIG;
         return chapters.flatMap((chapter, index) => {
             const normalized = normalizeChapterLabel(chapter, index + 1);
             const title = toMergedChapterTitle(normalized);
